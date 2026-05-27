@@ -25,6 +25,12 @@ from flashrag.config import Config
 from flashrag.utils import get_dataset
 
 
+def build_save_note(base_note, result_tag):
+    if result_tag:
+        return f"{base_note}-{result_tag}"
+    return base_note
+
+
 def reviewer_reasoning(args):
     """
     Run the ReviewerPipeline with a reasoning-optimized model.
@@ -32,7 +38,7 @@ def reviewer_reasoning(args):
     Uses models that are better at structured reasoning and evaluation,
     such as models trained with reasoning capabilities.
     """
-    save_note = "reviewer-reasoning"
+    save_note = build_save_note("reviewer-reasoning", args.result_tag)
     config_dict = {
         "save_note": save_note,
         "gpu_id": args.gpu_id,
@@ -72,7 +78,7 @@ def reviewer_multihop(args):
     This configuration uses more iterations and keeps more documents
     for complex multi-hop reasoning tasks like HotpotQA, 2WikiMultiHopQA.
     """
-    save_note = "reviewer-multihop"
+    save_note = build_save_note("reviewer-multihop", args.result_tag)
     config_dict = {
         "save_note": save_note,
         "gpu_id": args.gpu_id,
@@ -152,6 +158,8 @@ Examples:
                         help="Generator model name/path to override reviewer_config.yaml")
     parser.add_argument("--sample_size", type=int, default=3000,
                         help="Number of samples to run; use <=0 for the full split (default: 3000)")
+    parser.add_argument("--result_tag", type=str, default="",
+                        help="Optional suffix appended to save_note for distinguishing result directories")
 
     args = parser.parse_args()
 
@@ -170,6 +178,7 @@ Examples:
     print(f"Max docs: {args.max_docs}")
     print(f"Generator model: {args.generator_model or 'config default'}")
     print(f"Sample size: {args.sample_size}")
+    print(f"Result tag: {args.result_tag or 'none'}")
     print(f"{'='*60}\n")
 
     result = method_func(args)

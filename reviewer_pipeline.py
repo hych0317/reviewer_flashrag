@@ -213,15 +213,16 @@ Output format (JSON):
 }}
 ```"""
 
-FINAL_GENERATION_SYSTEM_PROMPT = """Answer questions strictly based on the provided documents and adoption policy below.
+FINAL_GENERATION_SYSTEM_PROMPT = """Answer questions strictly based on the provided documents and evidence guidance below.
 
-Adoption Policy:
+Evidence Guidance:
 {adoption_strategy}
 
-Use trusted claims first. Ignore documents listed in the policy. If a required slot is insufficient, answer with the best supported short answer only when possible.
+Use the supported facts first. Ignore documents marked as unreliable. If a required fact is incomplete, answer with the best supported short answer only when possible.
 For benchmark QA, still provide the most likely short answer from the documents when evidence is partial; avoid uncertainty-only answers unless no plausible answer is present.
 
-Only output the final answer without any other words.
+Only output the final answer. Do not explain your reasoning. Do not output JSON, field names, or internal policy terms such as trusted_claims, insufficient_slots, must_use_slots, ignored_docs, or conflict_resolution.
+Prefer a concise entity, date, number, location, title, yes/no answer, or short phrase.
 Expected output format examples:
 - Question: who got the first nobel prize in physics  
 Answer: Wilhelm Conrad Röntgen
@@ -1018,7 +1019,100 @@ class ReviewerPipeline(BasicPipeline):
         }
 
     def _render_adoption_policy(self, policy: Dict[str, Any]) -> str:
-        return json.dumps(policy, ensure_ascii=False, indent=2)
+        """Render internal policy as natural-language guidance for the generator."""
+        trusted_claims = policy.get("trusted_claims") or []
+        insufficient_slots = policy.get("insufficient_slots") or []
+        ignored_docs = policy.get("ignored_docs") or []
+        conflict_resolution = policy.get("conflict_resolution") or []
+
+        lines = ["Supported facts to use:"]
+        if trusted_claims:
+            for claim in trusted_claims[:12]:
+                text = str(claim.get("text") or "").strip()
+                doc_id = claim.get("doc_id")
+                if text:
+                    lines.append(f"- {text}" + (f" (source document id: {doc_id})" if doc_id else ""))
+        else:
+            lines.append("- No explicit supported claim was extracted; rely on the most relevant document text.")
+
+        if ignored_docs:
+            lines.append("Documents to avoid:")
+            lines.append("- Avoid document indices: " + ", ".join(str(idx) for idx in ignored_docs[:12]))
+
+        if conflict_resolution:
+            lines.append("Conflict handling:")
+            lines.append("- Prefer directly supported facts over contradicted or isolated claims.")
+
+        if insufficient_slots:
+            lines.append("Missing or partial evidence:")
+            lines.append("- Some required evidence is incomplete. Still provide the best supported short answer when a plausible candidate appears in the documents.")
+
+        lines.append("Output requirements:")
+        lines.append("- Return only the answer text, not explanations or internal policy labels.")
+        lines.append("- Never output words like trusted_claims, insufficient_slots, must_use_slots, ignored_docs, or conflict_resolution.")
+        return "\n".join(lines)
+
+    def _should_short_circuit_single_hop(self, state: Dict[str, Any], coverage: Dict[str, Any]) -> bool:
+        return (
+            state.get("question_type") == "single_hop"
+            and coverage.get("total", 0) > 0
+            and coverage.get("coverage", 0.0) >= 1.0
+            and coverage.get("conflicted", 0) == 0
+        )
+
+    def _fallback_answer_from_policy(self, policy: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not policy:
+            return None
+        candidates = []
+        for claim in policy.get("trusted_claims") or []:
+            text = str(claim.get("text") or "").strip()
+            if text:
+                candidates.append(text)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda text: (len(text.split()), len(text)))
+        return candidates[0]
+
+    def _clean_final_answer(self, pred: str, policy: Optional[Dict[str, Any]] = None) -> str:
+        answer = str(pred or "").strip()
+        if not answer:
+            return self._fallback_answer_from_policy(policy) or answer
+
+        markers = ["final answer:", "answer:"]
+        lower = answer.lower()
+        for marker in markers:
+            if marker in lower:
+                answer = answer[lower.rfind(marker) + len(marker):].strip()
+                lower = answer.lower()
+
+        policy_terms = {
+            "trusted_claims",
+            "insufficient_slots",
+            "must_use_slots",
+            "ignored_docs",
+            "conflict_resolution",
+            "fallback_instruction",
+        }
+        normalized = re.sub(r"[\s`\"':,.\[\]{}]+", "_", lower).strip("_")
+        has_policy_leak = any(term in lower or term == normalized for term in policy_terms)
+
+        uncertainty_only = normalized in {
+            "unknown",
+            "not_available",
+            "not_specified",
+            "cannot_determine",
+            "insufficient_evidence",
+            "none",
+        }
+        if has_policy_leak or uncertainty_only:
+            fallback = self._fallback_answer_from_policy(policy)
+            if fallback:
+                return fallback
+
+        first_line = next((line.strip() for line in answer.splitlines() if line.strip()), answer)
+        if len(answer.split()) > 80 and len(first_line.split()) <= 25:
+            answer = first_line
+        return answer.strip()
 
     def parse_reviewer_response(self, response: str) -> Dict[str, Any]:
         """Backward-compatible parser that does not default parse failures to ready."""
@@ -1369,6 +1463,12 @@ class ReviewerPipeline(BasicPipeline):
             )
             new_claim_count = self._count_new_claims(previous_state, evidence_state)
             coverage = self._slot_coverage(evidence_state)
+            if (
+                evidence_state.get("decision") == "continue_retrieval"
+                and self._should_short_circuit_single_hop(evidence_state, coverage)
+            ):
+                evidence_state["decision"] = "ready_to_answer"
+                evidence_state["retrieval_plan"] = []
             diagnostic_trace["review_trace"].append(self._review_step_trace(
                 iteration,
                 num_docs_before_review,
@@ -1526,6 +1626,7 @@ class ReviewerPipeline(BasicPipeline):
 
         # Generate final answer
         pred = self.generator.generate([final_prompt])[0]
+        pred = self._clean_final_answer(pred, adoption_policy)
         item.update_output("pred", pred)
         diagnostic_trace["final_trace"] = self._build_final_trace(
             pred,
@@ -1618,6 +1719,12 @@ class ReviewerPipeline(BasicPipeline):
                 )
                 new_claim_count = self._count_new_claims(previous_state, evidence_states[idx])
                 coverage = self._slot_coverage(evidence_states[idx])
+                if (
+                    evidence_states[idx].get("decision") == "continue_retrieval"
+                    and self._should_short_circuit_single_hop(evidence_states[idx], coverage)
+                ):
+                    evidence_states[idx]["decision"] = "ready_to_answer"
+                    evidence_states[idx]["retrieval_plan"] = []
                 diagnostic_traces[idx]["review_trace"].append(self._review_step_trace(
                     iteration,
                     num_docs_before_review,
@@ -1859,6 +1966,10 @@ class ReviewerPipeline(BasicPipeline):
         dataset.update_output("prompt", all_prompts)
 
         pred_answers = self._batched_generate(self.generator, all_prompts)
+        pred_answers = [
+            self._clean_final_answer(pred, adoption_policies[idx])
+            for idx, pred in enumerate(pred_answers)
+        ]
         dataset.update_output("pred", pred_answers)
         for idx, pred in enumerate(pred_answers):
             diagnostic_traces[idx]["final_trace"] = self._build_final_trace(

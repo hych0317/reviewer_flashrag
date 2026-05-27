@@ -8,6 +8,7 @@ SCREEN_NAME="reviewer_experiments"
 GPU_ID="1"
 GENERATOR_MODEL="qwen3-4B-Instruct"
 METHOD_NAME="reviewer_reasoning"
+RESULT_TAG="ver2"
 MAX_ITER="2"
 MAX_DOCS="8"
 SAMPLE_SIZE="1000"
@@ -25,6 +26,7 @@ DATASETS=(
   # "asqa:dev"
   # "fever:dev"
 )
+# HotpotQA、2Wiki、MuSiQue、AmbigQA 的组合最有说服力，TriviaQA 作为 sanity check
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
@@ -48,6 +50,7 @@ SUMMARY_LOG="${LOG_DIR}/run_all_${RUN_ID}.summary.log"
 echo "Run ID: ${RUN_ID}" | tee -a "${SUMMARY_LOG}"
 echo "Working directory: ${SCRIPT_DIR}" | tee -a "${SUMMARY_LOG}"
 echo "Method: ${METHOD_NAME}" | tee -a "${SUMMARY_LOG}"
+echo "Result tag: ${RESULT_TAG:-none}" | tee -a "${SUMMARY_LOG}"
 echo "Generator model: ${GENERATOR_MODEL}" | tee -a "${SUMMARY_LOG}"
 echo "GPU: ${GPU_ID}" | tee -a "${SUMMARY_LOG}"
 echo "Max iter: ${MAX_ITER}" | tee -a "${SUMMARY_LOG}"
@@ -77,6 +80,7 @@ for entry in "${DATASETS[@]}"; do
     --max_iter "${MAX_ITER}" \
     --max_docs "${MAX_DOCS}" \
     --generator_model "${GENERATOR_MODEL}" \
+    --result_tag "${RESULT_TAG}" \
     --sample_size "${SAMPLE_SIZE}" \
     > "${exp_log}" 2>&1
 
