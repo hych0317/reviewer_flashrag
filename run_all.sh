@@ -8,21 +8,31 @@ SCREEN_NAME="reviewer_experiments"
 GPU_ID="1"
 GENERATOR_MODEL="qwen3-4B-Instruct"
 METHOD_NAME="reviewer_reasoning"
-RESULT_TAG="ver2"
+RESULT_TAG="ver2_1"
 MAX_ITER="2"
 MAX_DOCS="8"
 SAMPLE_SIZE="1000"
 
 # Format: "dataset_name:split"
+# NQ: --dataset_name nq --split test
+# PopQA: --dataset_name popqa --split test
+# HotpotQA: --dataset_name hotpotqa --split dev/train
+# 2WikiMultiHopQA: --dataset_name 2wikimultihopqa --split dev/train
+# MuSiQue: --dataset_name musique --split dev/train
+# TriviaQA: --dataset_name triviaqa --split test/dev/train
+# StrategyQA: --dataset_name strategyqa --split train
+# AmbigQA: --dataset_name ambig_qa --split dev/train
+# ASQA: --dataset_name asqa --split dev/train
+# FEVER: --dataset_name fever --split dev/train
 DATASETS=(
-  "hotpotqa:dev"
-  "2wikimultihopqa:dev"
-  "musique:dev"
+  "hotpotqa:train"
+  "2wikimultihopqa:train"
+  "musique:train"
   # "nq:test"
-  "triviaqa:test"
+  "triviaqa:train"
   # "popqa:test"
   # "strategyqa:train"
-  "ambig_qa:dev"
+  "ambig_qa:train"
   # "asqa:dev"
   # "fever:dev"
 )

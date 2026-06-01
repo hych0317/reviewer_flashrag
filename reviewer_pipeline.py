@@ -1067,13 +1067,199 @@ class ReviewerPipeline(BasicPipeline):
         for claim in policy.get("trusted_claims") or []:
             text = str(claim.get("text") or "").strip()
             if text:
+                short_candidate = self._claim_to_short_answer_candidate(text)
+                if short_candidate:
+                    candidates.append(short_candidate)
                 candidates.append(text)
         if not candidates:
             return None
         candidates.sort(key=lambda text: (len(text.split()), len(text)))
         return candidates[0]
 
-    def _clean_final_answer(self, pred: str, policy: Optional[Dict[str, Any]] = None) -> str:
+    def _claim_to_short_answer_candidate(self, claim_text: str) -> Optional[str]:
+        text = str(claim_text or "").strip()
+        if not text:
+            return None
+
+        quoted = re.findall(r'"([^"\n]{2,80})"', text)
+        if quoted:
+            quoted.sort(key=lambda item: (len(item.split()), len(item)))
+            return quoted[0].strip()
+
+        date_match = re.search(
+            r"\b(?:in|on|during)\s+([A-Z][a-z]+(?:\s+\d{1,2})?,?\s+\d{4}|\d{4})\b",
+            text,
+        )
+        if date_match:
+            return date_match.group(1).strip(" ,.")
+
+        by_match = re.search(r"\b(?:by|created by|written by|performed by)\s+([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,4})", text)
+        if by_match:
+            return by_match.group(1).strip(" ,.")
+
+        role_match = re.search(r"\b(?:rapper|artist|singer|actor|actress|writer|composer|director|player)\s+([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,3})", text)
+        if role_match:
+            return role_match.group(1).strip(" ,.")
+
+        subject_match = re.match(r"^([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,5})\s+(?:is|was|were|won|created|wrote|served|appeared|features?)\b", text)
+        if subject_match:
+            return subject_match.group(1).strip(" ,.")
+
+        return None
+
+    def _looks_like_explanation(self, text: str) -> bool:
+        lower = str(text or "").lower()
+        explanation_markers = (
+            "provided documents",
+            "based on",
+            "therefore",
+            "however",
+            "while ",
+            "there is no",
+            "do not specify",
+            "does not specify",
+            "cannot be determined",
+            "unknown",
+            "the most supported answer",
+            "the answer is",
+            "answer is",
+            "according to",
+        )
+        return any(marker in lower for marker in explanation_markers)
+
+    def _extract_short_answer_candidate(self, answer: str) -> Optional[str]:
+        text = str(answer or "").strip()
+        if not text:
+            return None
+
+        marker_patterns = [
+            r"(?:the\s+)?most\s+supported\s+answer\s+is\s*:?\s*(.+)$",
+            r"(?:the\s+)?answer\s+is\s*:?\s*(.+)$",
+            r"(?:final\s+answer|answer)\s*:\s*(.+)$",
+        ]
+        for pattern in marker_patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                candidate = self._compress_short_answer(match.group(1))
+                if candidate and not self._is_uncertainty_answer(candidate):
+                    return candidate
+
+        lines = [line.strip(" -\t") for line in text.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if len(re.split(r"(?<=[.!?])\s+", line)) > 1:
+                continue
+            candidate = self._compress_short_answer(line)
+            if candidate and not self._looks_like_explanation(candidate) and not self._is_uncertainty_answer(candidate):
+                return candidate
+
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+        for sentence in sentences:
+            candidate = self._compress_short_answer(sentence)
+            if candidate and not self._looks_like_explanation(candidate) and not self._is_uncertainty_answer(candidate):
+                return candidate
+
+        return None
+
+    def _compress_short_answer(self, answer: str) -> Optional[str]:
+        candidate = str(answer or "").strip()
+        if not candidate:
+            return None
+
+        candidate = re.sub(r"^(?:[-*]\s+|\d+[.)]\s+)", "", candidate).strip()
+        candidate = re.sub(
+            r"^(?:therefore|thus|so|based on (?:the )?(?:documents|context|evidence),?|according to (?:the )?(?:documents|context|evidence),?)\s+",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
+        candidate = re.sub(
+            r"^(?:the\s+)?(?:answer|final answer|most supported answer)\s+(?:is|would be)\s*:?\s+",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        if not candidate:
+            return None
+
+        quoted = re.findall(r"'([^'\n]{2,80})'|\"([^\"\n]{2,80})\"", candidate)
+        quoted = [first or second for first, second in quoted]
+        if quoted:
+            quoted.sort(key=lambda item: (len(item.split()), len(item)))
+            return quoted[0].strip()
+
+        candidate = candidate.strip(" \"'`.,;:")
+
+        candidate = re.split(r"\n{2,}", candidate, maxsplit=1)[0].strip()
+        candidate = re.split(r"\s+(?:because|since|as shown by|according to)\s+", candidate, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        candidate = candidate.strip(" \"'`.,;:")
+
+        numeric = re.fullmatch(r"(\d+(?:\.\d+)?)\s+(?:episodes?|years?|people|points|votes|seasons?|games?|months?|days?)", candidate, flags=re.IGNORECASE)
+        if numeric:
+            return numeric.group(1)
+
+        predicate_object = re.search(
+            r"\b(?:presented|played|ended up|located|filmed|served|appeared)\s+(?:in|at|with|by|on)\s+([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,6}|[a-z]+)\b",
+            candidate,
+        )
+        if predicate_object:
+            return predicate_object.group(1).strip(" ,.")
+
+        final_value = re.search(r"\bis\s+([A-Za-z]+|\d+)\.?$", candidate, flags=re.IGNORECASE)
+        if final_value:
+            return final_value.group(1).strip(" ,.")
+
+        subject_winner = re.match(
+            r"^(?:The\s+)?([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,5})\s+(?:won|defeated|claimed)\b",
+            candidate,
+        )
+        if subject_winner:
+            return subject_winner.group(1).strip(" ,.")
+
+        title_tail = re.match(
+            r"^(?:the\s+)?(?:\d{4}\s+)?(?:[A-Za-z/-]+\s+){1,6}(?:film|movie|novel|song|album|series|classic)\s+(.+)$",
+            candidate,
+            flags=re.IGNORECASE,
+        )
+        if title_tail:
+            tail = title_tail.group(1).strip(" \"'`.,;:")
+            if 0 < len(tail.split()) <= 8:
+                return tail
+
+        if len(candidate.split()) <= 12:
+            return candidate
+        return None
+
+    def _is_uncertainty_answer(self, answer: str) -> bool:
+        normalized = re.sub(r"[\s`\"':,.\[\]{}-]+", "_", str(answer or "").lower()).strip("_")
+        return normalized in {
+            "unknown",
+            "not_available",
+            "not_specified",
+            "cannot_determine",
+            "insufficient_evidence",
+            "none",
+            "no_answer",
+        }
+
+    def _should_aggressively_clean_answer(
+        self,
+        policy: Optional[Dict[str, Any]],
+        evidence_state: Optional[Dict[str, Any]],
+    ) -> bool:
+        dataset_name = str(self.config["dataset_name"]).lower()
+        question_type = str((evidence_state or {}).get("question_type", "")).lower()
+        return (
+            dataset_name in {"triviaqa", "ambig_qa", "ambigqa"}
+            or question_type == "single_hop"
+        )
+
+    def _clean_final_answer(
+        self,
+        pred: str,
+        policy: Optional[Dict[str, Any]] = None,
+        evidence_state: Optional[Dict[str, Any]] = None,
+    ) -> str:
         answer = str(pred or "").strip()
         if not answer:
             return self._fallback_answer_from_policy(policy) or answer
@@ -1096,18 +1282,22 @@ class ReviewerPipeline(BasicPipeline):
         normalized = re.sub(r"[\s`\"':,.\[\]{}]+", "_", lower).strip("_")
         has_policy_leak = any(term in lower or term == normalized for term in policy_terms)
 
-        uncertainty_only = normalized in {
-            "unknown",
-            "not_available",
-            "not_specified",
-            "cannot_determine",
-            "insufficient_evidence",
-            "none",
-        }
+        uncertainty_only = self._is_uncertainty_answer(answer)
         if has_policy_leak or uncertainty_only:
             fallback = self._fallback_answer_from_policy(policy)
             if fallback:
                 return fallback
+
+        aggressive_clean = self._should_aggressively_clean_answer(policy, evidence_state)
+        if aggressive_clean:
+            short_candidate = self._extract_short_answer_candidate(answer)
+            if short_candidate:
+                return short_candidate
+
+            if self._looks_like_explanation(answer):
+                fallback = self._fallback_answer_from_policy(policy)
+                if fallback and len(fallback.split()) <= 12:
+                    return fallback
 
         first_line = next((line.strip() for line in answer.splitlines() if line.strip()), answer)
         if len(answer.split()) > 80 and len(first_line.split()) <= 25:
@@ -1626,7 +1816,7 @@ class ReviewerPipeline(BasicPipeline):
 
         # Generate final answer
         pred = self.generator.generate([final_prompt])[0]
-        pred = self._clean_final_answer(pred, adoption_policy)
+        pred = self._clean_final_answer(pred, adoption_policy, evidence_state)
         item.update_output("pred", pred)
         diagnostic_trace["final_trace"] = self._build_final_trace(
             pred,
@@ -1967,7 +2157,7 @@ class ReviewerPipeline(BasicPipeline):
 
         pred_answers = self._batched_generate(self.generator, all_prompts)
         pred_answers = [
-            self._clean_final_answer(pred, adoption_policies[idx])
+            self._clean_final_answer(pred, adoption_policies[idx], evidence_states[idx])
             for idx, pred in enumerate(pred_answers)
         ]
         dataset.update_output("pred", pred_answers)
