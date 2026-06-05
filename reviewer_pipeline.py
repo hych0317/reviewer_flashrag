@@ -34,6 +34,15 @@ Question types:
 - comparison: two or more entities must be compared
 - ambiguous: the question may have multiple interpretations
 
+Slot roles:
+- intermediate_entity: an entity or relation needed before the final answer can be retrieved
+- final_answer: the exact attribute, entity, yes/no result, or short phrase requested by the question
+- comparison_operand: an entity attribute needed for a comparison
+- direct_answer: a directly answerable fact for a single-hop question
+
+For bridge questions, always create at least one intermediate_entity slot and one final_answer slot.
+For comparison questions, create comparison_operand slots and one final_answer slot.
+
 Output only valid JSON:
 ```json
 {{
@@ -42,6 +51,8 @@ Output only valid JSON:
         {{
             "slot_id": "slot_1",
             "description": "specific fact needed to answer",
+            "slot_role": "intermediate_entity | final_answer | comparison_operand | direct_answer",
+            "depends_on": [],
             "status": "missing",
             "supporting_claim_ids": [],
             "conflicting_claim_ids": []
@@ -64,13 +75,16 @@ You receive a question, the current EvidenceState, and retrieved documents. Your
 3. Mark each slot as missing, partial, supported, or conflicted.
 4. Decide whether to continue retrieval, answer now, or force an answer with insufficient evidence.
 5. If retrieval is needed, produce slot-specific queries for only missing or conflicted slots.
+6. Identify whether the final answer itself is directly supported, not merely an intermediate fact.
 
 Rules:
 - Do not invent claims that are not in the documents.
 - Prefer short claims, one fact per claim.
 - Use support_status values: support, contradict, irrelevant.
 - Use decision values: continue_retrieval, ready_to_answer, force_answer.
-- If all required slots are supported, decision must be ready_to_answer.
+- Use direct_answer_supported=true only when a short answer candidate directly answers the original question.
+- If the final answer is not directly supported, decision must be continue_retrieval even when intermediate slots are supported.
+- For bridge questions, use resolved intermediate entities in second-hop queries for the final_answer slot.
 - If evidence is insufficient and more retrieval may help, decision must be continue_retrieval.
 - If evidence remains insufficient but no useful query can be generated, decision must be force_answer.
 - Output only valid JSON.
@@ -82,6 +96,8 @@ Output format:
         {{
             "slot_id": "slot_1",
             "description": "specific fact needed to answer",
+            "slot_role": "intermediate_entity | final_answer | comparison_operand | direct_answer",
+            "depends_on": [],
             "status": "missing | partial | supported | conflicted",
             "supporting_claim_ids": [],
             "conflicting_claim_ids": []
@@ -106,6 +122,9 @@ Output format:
     ],
     "docs_to_remove": [],
     "ignored_docs": [],
+    "direct_answer_supported": false,
+    "answer_candidate": null,
+    "answer_candidate_claim_ids": [],
     "decision": "continue_retrieval | ready_to_answer | force_answer",
     "failure_reason": null,
     "explanation": "brief evidence review"
@@ -204,6 +223,7 @@ Output format (JSON):
 ```json
 {{
     "trusted_claims": [],
+    "answer_candidates": [],
     "ignored_docs": [],
     "conflict_resolution": [],
     "must_use_slots": [],
@@ -639,6 +659,7 @@ class ReviewerPipeline(BasicPipeline):
             "question_type": state.get("question_type", ""),
             "slot_count": len(slots),
             "slot_descriptions": [slot.get("description", "") for slot in slots],
+            "slot_roles": [slot.get("slot_role", "") for slot in slots],
             "parse_failed": bool(parsed.get("parse_failed") or parsed.get("retry_failed")),
             "parse_error": parsed.get("parse_error") or parsed.get("retry_error"),
             "raw_response_on_failure": self._truncate_text(raw_response),
@@ -671,6 +692,9 @@ class ReviewerPipeline(BasicPipeline):
             "retrieval_plan": retrieval_plan,
             "docs_to_remove": state.get("docs_to_remove", []),
             "ignored_docs": state.get("ignored_docs", []),
+            "direct_answer_supported": bool(state.get("direct_answer_supported")),
+            "answer_candidate": state.get("answer_candidate"),
+            "ready_guard_triggered": bool(state.get("ready_guard_triggered")),
             "failure_reason": state.get("failure_reason"),
             "parse_failed": bool(parsed.get("parse_failed") or parsed.get("retry_failed")),
             "parse_error": parsed.get("parse_error") or parsed.get("retry_error"),
@@ -691,28 +715,30 @@ class ReviewerPipeline(BasicPipeline):
     def _fallback_slots(self, question: str, question_type: Optional[str] = None) -> List[Dict[str, Any]]:
         question_type = question_type or self._infer_question_type(question)
         if question_type == "comparison":
-            descriptions = [
-                "Identify the first entity and its relevant attribute.",
-                "Identify the second entity and its relevant attribute.",
-                "Compare the attributes to answer the question.",
+            slot_specs = [
+                ("comparison_operand", [], "Identify the first entity and its relevant attribute."),
+                ("comparison_operand", [], "Identify the second entity and its relevant attribute."),
+                ("final_answer", ["slot_1", "slot_2"], "Compare the attributes to answer the question."),
             ]
         elif question_type == "bridge":
-            descriptions = [
-                "Identify the intermediate entity or relation required by the question.",
-                "Use the intermediate entity or relation to determine the final answer.",
+            slot_specs = [
+                ("intermediate_entity", [], "Identify the intermediate entity or relation required by the question."),
+                ("final_answer", ["slot_1"], "Use the intermediate entity or relation to determine the final answer."),
             ]
         else:
-            descriptions = ["Find the direct fact that answers the question."]
+            slot_specs = [("direct_answer", [], "Find the direct fact that answers the question.")]
 
         return [
             {
                 "slot_id": f"slot_{idx + 1}",
                 "description": desc,
+                "slot_role": slot_role,
+                "depends_on": depends_on,
                 "status": "missing",
                 "supporting_claim_ids": [],
                 "conflicting_claim_ids": [],
             }
-            for idx, desc in enumerate(descriptions)
+            for idx, (slot_role, depends_on, desc) in enumerate(slot_specs)
         ]
 
     def _normalize_slots(self, slots: Any, question: str, question_type: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -734,12 +760,21 @@ class ReviewerPipeline(BasicPipeline):
             normalized.append({
                 "slot_id": slot_id,
                 "description": str(slot.get("description") or f"Required evidence slot {idx + 1}"),
+                "slot_role": str(slot.get("slot_role") or self._default_slot_role(question_type, idx, len(slots))),
+                "depends_on": list(slot.get("depends_on") or []),
                 "status": status,
                 "supporting_claim_ids": list(slot.get("supporting_claim_ids") or []),
                 "conflicting_claim_ids": list(slot.get("conflicting_claim_ids") or []),
             })
 
         return normalized or self._fallback_slots(question, question_type)
+
+    def _default_slot_role(self, question_type: Optional[str], idx: int, slot_count: int) -> str:
+        if question_type == "bridge":
+            return "final_answer" if idx == slot_count - 1 else "intermediate_entity"
+        if question_type == "comparison":
+            return "final_answer" if idx == slot_count - 1 else "comparison_operand"
+        return "direct_answer"
 
     def _normalize_question_analysis(self, parsed: Dict[str, Any], question: str) -> Dict[str, Any]:
         valid_types = {"single_hop", "bridge", "comparison", "ambiguous"}
@@ -753,6 +788,9 @@ class ReviewerPipeline(BasicPipeline):
             "claims": [],
             "retrieval_plan": [],
             "decision": "continue_retrieval",
+            "direct_answer_supported": False,
+            "answer_candidate": None,
+            "answer_candidate_claim_ids": [],
             "failure_reason": parsed.get("failure_reason"),
             "explanation": parsed.get("explanation", ""),
             "round_id": 0,
@@ -810,6 +848,51 @@ class ReviewerPipeline(BasicPipeline):
                 break
         return normalized
 
+    def _final_answer_slot_ids(self, slots: List[Dict[str, Any]]) -> set:
+        return {
+            slot.get("slot_id")
+            for slot in slots
+            if slot.get("slot_role") in {"final_answer", "direct_answer"}
+        }
+
+    def _build_bridge_fallback_plan(
+        self,
+        question: str,
+        slots: List[Dict[str, Any]],
+        claims: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        final_slots = [
+            slot for slot in slots
+            if slot.get("slot_role") == "final_answer"
+        ]
+        if not final_slots:
+            return []
+
+        intermediate_ids = {
+            slot.get("slot_id")
+            for slot in slots
+            if slot.get("slot_role") == "intermediate_entity"
+        }
+        intermediate_claims = [
+            claim.get("text", "").strip()
+            for claim in claims
+            if claim.get("slot_id") in intermediate_ids
+            and claim.get("support_status") == "support"
+            and claim.get("text")
+        ]
+        if not intermediate_claims:
+            return []
+
+        intermediate_claims.sort(key=lambda text: (len(text.split()), len(text)))
+        final_slot = final_slots[0]
+        intermediate_entity = self._claim_to_short_answer_candidate(intermediate_claims[0]) or intermediate_claims[0]
+        query = f"{intermediate_entity} {final_slot.get('description', '')}".strip()
+        return [{
+            "slot_id": final_slot.get("slot_id"),
+            "query": query,
+            "reason": "Retrieve the final answer attribute using the resolved intermediate entity.",
+        }]
+
     def _merge_evidence_state(
         self,
         previous_state: Dict[str, Any],
@@ -854,10 +937,39 @@ class ReviewerPipeline(BasicPipeline):
             decision = "continue_retrieval"
 
         retrieval_plan = self._normalize_retrieval_plan(parsed.get("retrieval_plan"), valid_slot_ids)
+        final_slots = [
+            slot for slot in slots
+            if slot.get("slot_role") in {"final_answer", "direct_answer"}
+        ]
+        if "direct_answer_supported" in parsed:
+            direct_answer_supported = bool(parsed.get("direct_answer_supported"))
+        else:
+            direct_answer_supported = bool(final_slots) and all(
+                slot.get("status") == "supported" for slot in final_slots
+            )
+        answer_candidate = str(parsed.get("answer_candidate") or "").strip() or None
+        answer_candidate_claim_ids = list(parsed.get("answer_candidate_claim_ids") or [])
+        final_answer_slot_ids = self._final_answer_slot_ids(slots)
+        candidate_claim_ids = {
+            claim.get("claim_id")
+            for claim in merged_claims
+            if claim.get("slot_id") in final_answer_slot_ids
+            and claim.get("support_status") == "support"
+        }
+        if answer_candidate and answer_candidate_claim_ids:
+            direct_answer_supported = bool(candidate_claim_ids.intersection(answer_candidate_claim_ids))
+
+        ready_guard_triggered = False
+        if decision == "ready_to_answer" and not direct_answer_supported:
+            ready_guard_triggered = True
+            if not retrieval_plan and previous_state.get("question_type") == "bridge":
+                retrieval_plan = self._build_bridge_fallback_plan(question, slots, merged_claims)
+            decision = "continue_retrieval" if retrieval_plan else "force_answer"
+
         if decision == "continue_retrieval" and not retrieval_plan:
             unresolved = [slot for slot in slots if slot["status"] in {"missing", "partial", "conflicted"}]
             if not unresolved:
-                decision = "ready_to_answer"
+                decision = "ready_to_answer" if direct_answer_supported else "force_answer"
             else:
                 decision = "force_answer"
 
@@ -867,6 +979,10 @@ class ReviewerPipeline(BasicPipeline):
             "claims": merged_claims,
             "retrieval_plan": retrieval_plan,
             "decision": decision,
+            "direct_answer_supported": direct_answer_supported,
+            "answer_candidate": answer_candidate,
+            "answer_candidate_claim_ids": answer_candidate_claim_ids,
+            "ready_guard_triggered": ready_guard_triggered,
             "docs_to_remove": self._sanitize_doc_indices(parsed.get("docs_to_remove", [])),
             "ignored_docs": self._sanitize_doc_indices(parsed.get("ignored_docs", [])),
             "failure_reason": parsed.get("failure_reason"),
@@ -996,8 +1112,20 @@ class ReviewerPipeline(BasicPipeline):
             slot["slot_id"] for slot in state.get("answer_slots", [])
             if slot.get("status") == "supported"
         ]
+        answer_candidates = []
+        answer_candidate = str(state.get("answer_candidate") or "").strip()
+        if answer_candidate:
+            answer_candidates.append(answer_candidate)
+        final_answer_slot_ids = self._final_answer_slot_ids(state.get("answer_slots", []))
+        for claim in trusted_claims:
+            if claim.get("slot_id") not in final_answer_slot_ids:
+                continue
+            candidate = self._claim_to_short_answer_candidate(claim.get("text", ""))
+            if candidate and candidate not in answer_candidates:
+                answer_candidates.append(candidate)
         return {
             "trusted_claims": trusted_claims,
+            "answer_candidates": answer_candidates[:8],
             "ignored_docs": state.get("ignored_docs", []),
             "conflict_resolution": [
                 {
@@ -1021,6 +1149,7 @@ class ReviewerPipeline(BasicPipeline):
     def _render_adoption_policy(self, policy: Dict[str, Any]) -> str:
         """Render internal policy as natural-language guidance for the generator."""
         trusted_claims = policy.get("trusted_claims") or []
+        answer_candidates = policy.get("answer_candidates") or []
         insufficient_slots = policy.get("insufficient_slots") or []
         ignored_docs = policy.get("ignored_docs") or []
         conflict_resolution = policy.get("conflict_resolution") or []
@@ -1034,6 +1163,12 @@ class ReviewerPipeline(BasicPipeline):
                     lines.append(f"- {text}" + (f" (source document id: {doc_id})" if doc_id else ""))
         else:
             lines.append("- No explicit supported claim was extracted; rely on the most relevant document text.")
+
+        if answer_candidates:
+            lines.append("Preferred short answer candidates:")
+            for candidate in answer_candidates[:8]:
+                lines.append(f"- {candidate}")
+            lines.append("- Prefer the shortest candidate that fully answers the question.")
 
         if ignored_docs:
             lines.append("Documents to avoid:")
@@ -1055,6 +1190,7 @@ class ReviewerPipeline(BasicPipeline):
     def _should_short_circuit_single_hop(self, state: Dict[str, Any], coverage: Dict[str, Any]) -> bool:
         return (
             state.get("question_type") == "single_hop"
+            and bool(state.get("direct_answer_supported"))
             and coverage.get("total", 0) > 0
             and coverage.get("coverage", 0.0) >= 1.0
             and coverage.get("conflicted", 0) == 0
@@ -1063,6 +1199,13 @@ class ReviewerPipeline(BasicPipeline):
     def _fallback_answer_from_policy(self, policy: Optional[Dict[str, Any]]) -> Optional[str]:
         if not policy:
             return None
+        answer_candidates = [
+            str(candidate).strip()
+            for candidate in policy.get("answer_candidates") or []
+            if str(candidate).strip()
+        ]
+        if answer_candidates:
+            return answer_candidates[0]
         candidates = []
         for claim in policy.get("trusted_claims") or []:
             text = str(claim.get("text") or "").strip()
@@ -1101,7 +1244,7 @@ class ReviewerPipeline(BasicPipeline):
         if role_match:
             return role_match.group(1).strip(" ,.")
 
-        subject_match = re.match(r"^([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,5})\s+(?:is|was|were|won|created|wrote|served|appeared|features?)\b", text)
+        subject_match = re.match(r"^([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,5})\s+(?:is|was|were|won|created|wrote|served|appeared|features?|portrayed|directed|played|held|starred)\b", text)
         if subject_match:
             return subject_match.group(1).strip(" ,.")
 
@@ -1606,6 +1749,7 @@ class ReviewerPipeline(BasicPipeline):
         fallback = self._build_adoption_policy(state, docs, failure_reason=failure_reason)
         policy = {
             "trusted_claims": parsed.get("trusted_claims", fallback["trusted_claims"]),
+            "answer_candidates": parsed.get("answer_candidates", fallback["answer_candidates"]),
             "ignored_docs": parsed.get("ignored_docs", fallback["ignored_docs"]),
             "conflict_resolution": parsed.get("conflict_resolution", fallback["conflict_resolution"]),
             "must_use_slots": parsed.get("must_use_slots", fallback["must_use_slots"]),
