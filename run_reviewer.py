@@ -31,6 +31,11 @@ def build_save_note(base_note, result_tag):
     return base_note
 
 
+def build_save_dir(dataset_name, split):
+    result_split = "dev" if split == "test" else split
+    return os.path.join("./result", result_split, dataset_name)
+
+
 def reviewer_reasoning(args):
     """
     Run the ReviewerPipeline with a reasoning-optimized model.
@@ -41,6 +46,7 @@ def reviewer_reasoning(args):
     save_note = build_save_note("reviewer-reasoning", args.result_tag)
     config_dict = {
         "save_note": save_note,
+        "save_dir": build_save_dir(args.dataset_name, args.split),
         "gpu_id": args.gpu_id,
         "dataset_name": args.dataset_name,
         "split": args.split,
@@ -81,6 +87,7 @@ def reviewer_multihop(args):
     save_note = build_save_note("reviewer-multihop", args.result_tag)
     config_dict = {
         "save_note": save_note,
+        "save_dir": build_save_dir(args.dataset_name, args.split),
         "gpu_id": args.gpu_id,
         "dataset_name": args.dataset_name,
         "split": args.split,

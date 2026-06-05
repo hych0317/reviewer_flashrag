@@ -8,35 +8,52 @@ SCREEN_NAME="reviewer_experiments"
 GPU_ID="1"
 GENERATOR_MODEL="qwen3-4B-Instruct"
 METHOD_NAME="reviewer_reasoning"
-RESULT_TAG="ver2_1"
+RESULT_TAG="ver2_2"
 MAX_ITER="2"
 MAX_DOCS="8"
 SAMPLE_SIZE="1000"
+SPLIT_MODE="test"  # train or test
 
-# Format: "dataset_name:split"
-# NQ: --dataset_name nq --split test
-# PopQA: --dataset_name popqa --split test
-# HotpotQA: --dataset_name hotpotqa --split dev/train
-# 2WikiMultiHopQA: --dataset_name 2wikimultihopqa --split dev/train
-# MuSiQue: --dataset_name musique --split dev/train
-# TriviaQA: --dataset_name triviaqa --split test/dev/train
-# StrategyQA: --dataset_name strategyqa --split train
-# AmbigQA: --dataset_name ambig_qa --split dev/train
-# ASQA: --dataset_name asqa --split dev/train
-# FEVER: --dataset_name fever --split dev/train
 DATASETS=(
-  "hotpotqa:train"
-  "2wikimultihopqa:train"
-  "musique:train"
-  # "nq:test"
-  "triviaqa:train"
-  # "popqa:test"
-  # "strategyqa:train"
-  "ambig_qa:train"
-  # "asqa:dev"
-  # "fever:dev"
+  "hotpotqa"
+  "2wikimultihopqa"
+  "musique"
+  # "nq"
+  "triviaqa"
+  # "popqa"
+  # "strategyqa"
+  "ambig_qa"
+  # "asqa"
+  # "fever"
 )
 # HotpotQA、2Wiki、MuSiQue、AmbigQA 的组合最有说服力，TriviaQA 作为 sanity check
+
+resolve_split() {
+  local dataset="$1"
+
+  case "${SPLIT_MODE}" in
+    train)
+      echo "train"
+      ;;
+    test)
+      case "${dataset}" in
+        nq|popqa|triviaqa)
+          echo "test"
+          ;;
+        strategyqa)
+          echo "train"
+          ;;
+        *)
+          echo "dev"
+          ;;
+      esac
+      ;;
+    *)
+      echo "Unsupported SPLIT_MODE: ${SPLIT_MODE}" >&2
+      return 1
+      ;;
+  esac
+}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
@@ -66,14 +83,15 @@ echo "GPU: ${GPU_ID}" | tee -a "${SUMMARY_LOG}"
 echo "Max iter: ${MAX_ITER}" | tee -a "${SUMMARY_LOG}"
 echo "Max docs: ${MAX_DOCS}" | tee -a "${SUMMARY_LOG}"
 echo "Sample size: ${SAMPLE_SIZE}" | tee -a "${SUMMARY_LOG}"
+echo "Split mode: ${SPLIT_MODE}" | tee -a "${SUMMARY_LOG}"
 echo "" | tee -a "${SUMMARY_LOG}"
 
 SUCCESS=()
 FAILED=()
 
 for entry in "${DATASETS[@]}"; do
-  dataset="${entry%%:*}"
-  split="${entry#*:}"
+  dataset="${entry}"
+  split="$(resolve_split "${dataset}")" || exit 1
   exp_name="${dataset}_${split}_${RUN_ID}"
   exp_log="${LOG_DIR}/${exp_name}.log"
 

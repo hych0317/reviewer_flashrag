@@ -7,6 +7,7 @@ and the EvidenceState-controlled outputs.
 Usage:
     python3 analyze_reviewer_results.py
     python3 analyze_reviewer_results.py examples/reviewer/result/*/intermediate_data.json
+    python3 analyze_reviewer_results.py examples/reviewer/result/*/*/*/intermediate_data.json
 """
 
 import argparse
@@ -287,7 +288,10 @@ def main() -> None:
     parser.add_argument(
         "paths",
         nargs="*",
-        default=["examples/reviewer/result/*/intermediate_data.json"],
+        default=[
+            "examples/reviewer/result/*/intermediate_data.json",
+            "examples/reviewer/result/*/*/*/intermediate_data.json",
+        ],
         help="Files or glob patterns to analyze.",
     )
     args = parser.parse_args()
