@@ -8,6 +8,7 @@ Usage:
     python3 analyze_reviewer_results.py
     python3 analyze_reviewer_results.py examples/reviewer/result/*/intermediate_data.json
     python3 analyze_reviewer_results.py examples/reviewer/result/*/*/*/intermediate_data.json
+    python3 analyze_reviewer_results.py examples/reviewer/result/*/*/*/*/intermediate_data.json
 """
 
 import argparse
@@ -166,6 +167,11 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
     total_new_docs = 0
     adaptive_gold_hits = 0
     slot_statuses = Counter()
+    answer_types = Counter()
+    repair_methods = Counter()
+    candidate_sources = Counter()
+    guard_extra_used = 0
+    guard_triggered = 0
     coverage_sum = 0.0
     coverage_count = 0
     case_candidates = Counter()
@@ -187,8 +193,28 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
                 adaptive_gold_hits += 1
 
         state = output_of(item).get("evidence_state") or {}
+        answer_type = state.get("answer_type")
+        if answer_type:
+            answer_types[str(answer_type)] += 1
+        if state.get("ready_guard_triggered"):
+            guard_triggered += 1
+        if state.get("guard_extra_round_used"):
+            guard_extra_used += 1
+
         for slot in state.get("answer_slots") or []:
             slot_statuses[str(slot.get("status") or "unknown")] += 1
+
+        policy = output_of(item).get("adoption_policy") or {}
+        if policy.get("candidate_source"):
+            candidate_sources[str(policy.get("candidate_source"))] += 1
+
+        qa = trace.get("question_analysis") or {}
+        if qa.get("repair_method"):
+            repair_methods[str(qa.get("repair_method"))] += 1
+        for review in trace.get("review_trace") or []:
+            if review.get("repair_method"):
+                repair_methods[str(review.get("repair_method"))] += 1
+
         coverage = output_of(item).get("slot_coverage") or {}
         if "coverage" in coverage:
             coverage_sum += float(coverage.get("coverage") or 0.0)
@@ -214,7 +240,12 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
         print(f"avg_new_docs\t{total_new_docs / traced:.3f}")
         print(f"adaptive_query_gold_hit_rate\t{adaptive_gold_hits / total_queries:.4f}" if total_queries else "adaptive_query_gold_hit_rate\t0.0000")
         print(f"avg_slot_coverage\t{coverage_sum / coverage_count:.4f}" if coverage_count else "avg_slot_coverage\t0.0000")
+        print(f"guard_trigger_rate\t{guard_triggered / traced:.4f}")
+        print(f"guard_extra_used_rate\t{guard_extra_used / traced:.4f}")
     print_counter("slot_statuses", slot_statuses)
+    print_counter("answer_types", answer_types)
+    print_counter("repair_methods", repair_methods)
+    print_counter("candidate_sources", candidate_sources)
     print_counter("case_study_candidates", case_candidates)
 
 
@@ -291,6 +322,7 @@ def main() -> None:
         default=[
             "examples/reviewer/result/*/intermediate_data.json",
             "examples/reviewer/result/*/*/*/intermediate_data.json",
+            "examples/reviewer/result/*/*/*/*/intermediate_data.json",
         ],
         help="Files or glob patterns to analyze.",
     )

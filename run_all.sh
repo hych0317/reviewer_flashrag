@@ -6,9 +6,9 @@ set -u
 
 SCREEN_NAME="reviewer_experiments"
 GPU_ID="1"
-GENERATOR_MODEL="qwen3-4B-Instruct"
+GENERATOR_MODEL="qwen3-8B"
 METHOD_NAME="reviewer_reasoning"
-RESULT_TAG="ver2_2"
+RESULT_TAG="ver2_3"
 MAX_ITER="2"
 MAX_DOCS="8"
 SAMPLE_SIZE="1000"
@@ -135,3 +135,11 @@ for item in "${FAILED[@]}"; do
   echo "  FAIL ${item}" | tee -a "${SUMMARY_LOG}"
 done
 echo "Summary log: ${SUMMARY_LOG}" | tee -a "${SUMMARY_LOG}"
+
+BARK_MESSAGE="FlashRAG_reviewer_completed_${#SUCCESS[@]}_ok_${#FAILED[@]}_failed_run_${RUN_ID}"
+BARK_URL="https://api.day.app/s2V59sqe7asj9kP2GiqpNG/${BARK_MESSAGE}"
+if curl -fsS "${BARK_URL}" >/dev/null; then
+  echo "Bark notification sent." | tee -a "${SUMMARY_LOG}"
+else
+  echo "Warning: Bark notification failed." | tee -a "${SUMMARY_LOG}"
+fi

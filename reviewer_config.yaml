@@ -7,6 +7,7 @@ model2path:
   llama3.1-8B-instruct: "/home/flyvideo/Sata2/hyc/models/Meta-Llama-3.1-8B-Instruct"
   qwen2.5-7B-Instruct: "/home/flyvideo/Sata2/hyc/models/Qwen2.5-7B-Instruct"
   qwen3-4B-Instruct: "/home/flyvideo/Sata2/hyc/models/Qwen3-4B-Instruct"
+  qwen3-8B: "/home/flyvideo/Sata2/hyc/models/Qwen3-8B"
   searchr1: "/home/flyvideo/Sata2/hyc/projects/RAG/FlashRAG/model/SearchR1-nq_hotpotqa_train-llama3.2-3b-em-grpo"
 
 # Pooling methods for each embedding model

@@ -92,12 +92,9 @@ Rules:
 Output format:
 ```json
 {{
-    "answer_slots": [
+    "slot_updates": [
         {{
             "slot_id": "slot_1",
-            "description": "specific fact needed to answer",
-            "slot_role": "intermediate_entity | final_answer | comparison_operand | direct_answer",
-            "depends_on": [],
             "status": "missing | partial | supported | conflicted",
             "supporting_claim_ids": [],
             "conflicting_claim_ids": []
@@ -123,6 +120,7 @@ Output format:
     "docs_to_remove": [],
     "ignored_docs": [],
     "direct_answer_supported": false,
+    "answer_type": "yes_no | person | date | location | title_or_entity | number | phrase",
     "answer_candidate": null,
     "answer_candidate_claim_ids": [],
     "decision": "continue_retrieval | ready_to_answer | force_answer",
@@ -530,12 +528,48 @@ class ReviewerPipeline(BasicPipeline):
 
         raise ValueError("No JSON object found in response")
 
+    def _repair_json_text(self, text: str) -> Optional[str]:
+        """Apply conservative JSON text repairs before asking the model to retry."""
+        if not text:
+            return None
+
+        repaired = text.strip()
+        repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+
+        open_braces = repaired.count("{") - repaired.count("}")
+        open_brackets = repaired.count("[") - repaired.count("]")
+        if open_brackets > 0:
+            repaired += "]" * open_brackets
+        if open_braces > 0:
+            repaired += "}" * open_braces
+
+        return repaired if repaired != text else None
+
     def _parse_json_response(self, response: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """Parse a JSON object without converting failures into READY decisions."""
         try:
-            return json.loads(self._extract_json_text(response)), None
+            parsed = json.loads(self._extract_json_text(response))
+            if isinstance(parsed, dict):
+                return parsed, None
+            return None, "Parsed JSON is not an object"
         except (json.JSONDecodeError, ValueError, TypeError) as e:
-            return None, str(e)
+            first_error = str(e)
+
+        try:
+            json_text = self._extract_json_text(response)
+            repaired = self._repair_json_text(json_text)
+            if repaired:
+                parsed = json.loads(repaired)
+                if isinstance(parsed, dict):
+                    parsed["repaired"] = True
+                    parsed["repair_method"] = "deterministic_json_repair"
+                    parsed["parse_error"] = first_error
+                    parsed["raw_response"] = response
+                    return parsed, None
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        return None, first_error
 
     def _repair_prompt(self, original_prompt: str, bad_response: str, error: str) -> str:
         return (
@@ -588,6 +622,7 @@ class ReviewerPipeline(BasicPipeline):
                 else:
                     parsed["parse_failed"] = False
                     parsed["repaired"] = True
+                    parsed["repair_method"] = parsed.get("repair_method") or "model_json_retry"
                     parsed["parse_error"] = parsed_results[idx].get("parse_error")
                     parsed["raw_response"] = parsed_results[idx].get("raw_response")
                     parsed_results[idx] = parsed
@@ -657,6 +692,7 @@ class ReviewerPipeline(BasicPipeline):
             raw_response = parsed.get("raw_response") or parsed.get("retry_response")
         return {
             "question_type": state.get("question_type", ""),
+            "answer_type": state.get("answer_type"),
             "slot_count": len(slots),
             "slot_descriptions": [slot.get("description", "") for slot in slots],
             "slot_roles": [slot.get("slot_role", "") for slot in slots],
@@ -664,6 +700,7 @@ class ReviewerPipeline(BasicPipeline):
             "parse_error": parsed.get("parse_error") or parsed.get("retry_error"),
             "raw_response_on_failure": self._truncate_text(raw_response),
             "repaired": bool(parsed.get("repaired")),
+            "repair_method": parsed.get("repair_method"),
         }
 
     def _review_step_trace(
@@ -693,12 +730,16 @@ class ReviewerPipeline(BasicPipeline):
             "docs_to_remove": state.get("docs_to_remove", []),
             "ignored_docs": state.get("ignored_docs", []),
             "direct_answer_supported": bool(state.get("direct_answer_supported")),
+            "answer_type": state.get("answer_type"),
             "answer_candidate": state.get("answer_candidate"),
             "ready_guard_triggered": bool(state.get("ready_guard_triggered")),
+            "guard_extra_round_pending": bool(state.get("guard_extra_round_pending")),
+            "guard_extra_round_used": bool(state.get("guard_extra_round_used")),
             "failure_reason": state.get("failure_reason"),
             "parse_failed": bool(parsed.get("parse_failed") or parsed.get("retry_failed")),
             "parse_error": parsed.get("parse_error") or parsed.get("retry_error"),
             "repaired": bool(parsed.get("repaired")),
+            "repair_method": parsed.get("repair_method"),
             "raw_response_on_failure": self._truncate_text(raw_response),
         }
 
@@ -711,6 +752,22 @@ class ReviewerPipeline(BasicPipeline):
         if any(marker in q for marker in bridge_markers) and (" of " in q or " by " in q or " in " in q):
             return "bridge"
         return "single_hop"
+
+    def _infer_answer_type(self, question: str) -> str:
+        q = str(question or "").lower().strip()
+        if q.startswith(("is ", "are ", "was ", "were ", "do ", "does ", "did ", "can ", "could ", "has ", "have ", "had ")):
+            return "yes_no"
+        if re.search(r"\b(how many|how much|what number|what year|what percentage|what percent)\b", q):
+            return "number"
+        if re.search(r"\b(when|what date|which year|what year)\b", q):
+            return "date"
+        if re.search(r"\b(where|what city|what country|which country|which city|location)\b", q):
+            return "location"
+        if re.search(r"\b(who|whose|person|actor|actress|singer|writer|director|president|player|composer)\b", q):
+            return "person"
+        if re.search(r"\b(which|what film|what movie|what book|what novel|what song|what album|what series)\b", q):
+            return "title_or_entity"
+        return "phrase"
 
     def _fallback_slots(self, question: str, question_type: Optional[str] = None) -> List[Dict[str, Any]]:
         question_type = question_type or self._infer_question_type(question)
@@ -788,6 +845,7 @@ class ReviewerPipeline(BasicPipeline):
             "claims": [],
             "retrieval_plan": [],
             "decision": "continue_retrieval",
+            "answer_type": self._infer_answer_type(question),
             "direct_answer_supported": False,
             "answer_candidate": None,
             "answer_candidate_claim_ids": [],
@@ -848,6 +906,29 @@ class ReviewerPipeline(BasicPipeline):
                 break
         return normalized
 
+    def _normalize_slot_updates(self, updates: Any, previous_slots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        slots = json.loads(json.dumps(previous_slots or []))
+        if not isinstance(updates, list):
+            return slots
+
+        slots_by_id = {str(slot.get("slot_id")): slot for slot in slots}
+        valid_statuses = {"missing", "partial", "supported", "conflicted"}
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            slot_id = str(update.get("slot_id") or "")
+            slot = slots_by_id.get(slot_id)
+            if not slot:
+                continue
+            status = update.get("status")
+            if status in valid_statuses:
+                slot["status"] = status
+            if "supporting_claim_ids" in update:
+                slot["supporting_claim_ids"] = list(update.get("supporting_claim_ids") or [])
+            if "conflicting_claim_ids" in update:
+                slot["conflicting_claim_ids"] = list(update.get("conflicting_claim_ids") or [])
+        return slots
+
     def _final_answer_slot_ids(self, slots: List[Dict[str, Any]]) -> set:
         return {
             slot.get("slot_id")
@@ -902,17 +983,23 @@ class ReviewerPipeline(BasicPipeline):
     ) -> Dict[str, Any]:
         if parsed.get("parse_failed"):
             state = json.loads(json.dumps(previous_state))
-            state["decision"] = "ready_to_answer"
+            state["decision"] = "ready_to_answer" if state.get("direct_answer_supported") else "force_answer"
             state["failure_reason"] = "parse_failure_fallback"
             state["retrieval_plan"] = []
             state["round_id"] = round_id
             return state
 
-        slots = self._normalize_slots(
-            parsed.get("answer_slots", previous_state.get("answer_slots")),
-            question,
-            previous_state.get("question_type"),
-        )
+        if "answer_slots" in parsed:
+            slots = self._normalize_slots(
+                parsed.get("answer_slots", previous_state.get("answer_slots")),
+                question,
+                previous_state.get("question_type"),
+            )
+        else:
+            slots = self._normalize_slot_updates(
+                parsed.get("slot_updates"),
+                previous_state.get("answer_slots", []),
+            )
         valid_slot_ids = {slot["slot_id"] for slot in slots}
 
         old_claims = previous_state.get("claims", [])
@@ -949,6 +1036,10 @@ class ReviewerPipeline(BasicPipeline):
             )
         answer_candidate = str(parsed.get("answer_candidate") or "").strip() or None
         answer_candidate_claim_ids = list(parsed.get("answer_candidate_claim_ids") or [])
+        valid_answer_types = {"yes_no", "person", "date", "location", "title_or_entity", "number", "phrase"}
+        answer_type = parsed.get("answer_type") or previous_state.get("answer_type") or self._infer_answer_type(question)
+        if answer_type not in valid_answer_types:
+            answer_type = self._infer_answer_type(question)
         final_answer_slot_ids = self._final_answer_slot_ids(slots)
         candidate_claim_ids = {
             claim.get("claim_id")
@@ -960,10 +1051,13 @@ class ReviewerPipeline(BasicPipeline):
             direct_answer_supported = bool(candidate_claim_ids.intersection(answer_candidate_claim_ids))
 
         ready_guard_triggered = False
+        guard_extra_round_pending = bool(previous_state.get("guard_extra_round_pending"))
         if decision == "ready_to_answer" and not direct_answer_supported:
             ready_guard_triggered = True
             if not retrieval_plan and previous_state.get("question_type") == "bridge":
                 retrieval_plan = self._build_bridge_fallback_plan(question, slots, merged_claims)
+            if retrieval_plan and not previous_state.get("guard_extra_round_used"):
+                guard_extra_round_pending = True
             decision = "continue_retrieval" if retrieval_plan else "force_answer"
 
         if decision == "continue_retrieval" and not retrieval_plan:
@@ -979,10 +1073,13 @@ class ReviewerPipeline(BasicPipeline):
             "claims": merged_claims,
             "retrieval_plan": retrieval_plan,
             "decision": decision,
+            "answer_type": answer_type,
             "direct_answer_supported": direct_answer_supported,
             "answer_candidate": answer_candidate,
             "answer_candidate_claim_ids": answer_candidate_claim_ids,
-            "ready_guard_triggered": ready_guard_triggered,
+            "ready_guard_triggered": bool(previous_state.get("ready_guard_triggered")) or ready_guard_triggered,
+            "guard_extra_round_pending": guard_extra_round_pending,
+            "guard_extra_round_used": bool(previous_state.get("guard_extra_round_used")),
             "docs_to_remove": self._sanitize_doc_indices(parsed.get("docs_to_remove", [])),
             "ignored_docs": self._sanitize_doc_indices(parsed.get("ignored_docs", [])),
             "failure_reason": parsed.get("failure_reason"),
@@ -1123,9 +1220,24 @@ class ReviewerPipeline(BasicPipeline):
             candidate = self._claim_to_short_answer_candidate(claim.get("text", ""))
             if candidate and candidate not in answer_candidates:
                 answer_candidates.append(candidate)
+        selected_answer_candidate = self._select_answer_candidate(
+            answer_candidates,
+            state.get("answer_type"),
+        )
+        compressed_answer_candidate = self._compress_short_answer(answer_candidate) if answer_candidate else None
+        candidate_source = None
+        if selected_answer_candidate:
+            candidate_source = (
+                "answer_candidate"
+                if selected_answer_candidate in {answer_candidate, compressed_answer_candidate}
+                else "trusted_claim"
+            )
         return {
             "trusted_claims": trusted_claims,
             "answer_candidates": answer_candidates[:8],
+            "selected_answer_candidate": selected_answer_candidate,
+            "candidate_source": candidate_source,
+            "answer_type": state.get("answer_type"),
             "ignored_docs": state.get("ignored_docs", []),
             "conflict_resolution": [
                 {
@@ -1166,7 +1278,12 @@ class ReviewerPipeline(BasicPipeline):
 
         if answer_candidates:
             lines.append("Preferred short answer candidates:")
+            selected_answer_candidate = str(policy.get("selected_answer_candidate") or "").strip()
+            if selected_answer_candidate:
+                lines.append(f"- {selected_answer_candidate}")
             for candidate in answer_candidates[:8]:
+                if candidate == selected_answer_candidate:
+                    continue
                 lines.append(f"- {candidate}")
             lines.append("- Prefer the shortest candidate that fully answers the question.")
 
@@ -1199,12 +1316,18 @@ class ReviewerPipeline(BasicPipeline):
     def _fallback_answer_from_policy(self, policy: Optional[Dict[str, Any]]) -> Optional[str]:
         if not policy:
             return None
+        selected = str(policy.get("selected_answer_candidate") or "").strip()
+        if selected:
+            return selected
         answer_candidates = [
             str(candidate).strip()
             for candidate in policy.get("answer_candidates") or []
             if str(candidate).strip()
         ]
         if answer_candidates:
+            selected = self._select_answer_candidate(answer_candidates, policy.get("answer_type"))
+            if selected:
+                return selected
             return answer_candidates[0]
         candidates = []
         for claim in policy.get("trusted_claims") or []:
@@ -1218,6 +1341,39 @@ class ReviewerPipeline(BasicPipeline):
             return None
         candidates.sort(key=lambda text: (len(text.split()), len(text)))
         return candidates[0]
+
+    def _select_answer_candidate(self, candidates: List[str], answer_type: Optional[str]) -> Optional[str]:
+        normalized = []
+        for candidate in candidates or []:
+            candidate = self._compress_short_answer(candidate) or str(candidate).strip()
+            if not candidate or candidate in normalized:
+                continue
+            normalized.append(candidate)
+
+        matching = [
+            candidate for candidate in normalized
+            if self._candidate_matches_answer_type(candidate, answer_type)
+        ]
+        pool = matching or normalized
+        if not pool:
+            return None
+        pool.sort(key=lambda text: (len(text.split()), len(text)))
+        return pool[0]
+
+    def _candidate_matches_answer_type(self, candidate: str, answer_type: Optional[str]) -> bool:
+        text = str(candidate or "").strip()
+        if not text:
+            return False
+        answer_type = str(answer_type or "").lower()
+        if answer_type == "yes_no":
+            return text.lower() in {"yes", "no"}
+        if answer_type == "number":
+            return bool(re.search(r"\d", text))
+        if answer_type == "date":
+            return bool(re.search(r"\b\d{4}\b|\b(?:january|february|march|april|may|june|july|august|september|october|november|december)\b", text, re.IGNORECASE))
+        if answer_type in {"person", "location", "title_or_entity"}:
+            return bool(re.search(r"\b[A-Z][A-Za-z0-9$'.-]+", text)) and len(text.split()) <= 8
+        return len(text.split()) <= 12
 
     def _claim_to_short_answer_candidate(self, claim_text: str) -> Optional[str]:
         text = str(claim_text or "").strip()
@@ -1562,9 +1718,21 @@ class ReviewerPipeline(BasicPipeline):
         return self.evidence_reviewer_prompt_template.get_string(
             question=question,
             formatted_docs=self.format_docs_for_review(docs),
-            evidence_state=json.dumps(state, ensure_ascii=False, indent=2),
+            evidence_state=json.dumps(self._state_for_reviewer(state), ensure_ascii=False, indent=2),
             round_id=round_id,
         )
+
+    def _state_for_reviewer(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep the reviewer state compact so JSON generation is less brittle."""
+        return {
+            "question_type": state.get("question_type"),
+            "answer_type": state.get("answer_type"),
+            "answer_slots": state.get("answer_slots", []),
+            "claims": state.get("claims", [])[-16:],
+            "direct_answer_supported": bool(state.get("direct_answer_supported")),
+            "answer_candidate": state.get("answer_candidate"),
+            "round_id": state.get("round_id"),
+        }
 
     def _retrieve_for_plans(
         self,
@@ -1715,6 +1883,11 @@ class ReviewerPipeline(BasicPipeline):
             "answer_length": len(str(pred).split()),
             "used_forced_policy": state.get("decision") == "force_answer" or bool(state.get("failure_reason")),
             "failure_reason": state.get("failure_reason"),
+            "answer_type": state.get("answer_type"),
+            "direct_answer_supported": bool(state.get("direct_answer_supported")),
+            "answer_candidate": state.get("answer_candidate"),
+            "ready_guard_triggered": bool(state.get("ready_guard_triggered")),
+            "guard_extra_round_used": bool(state.get("guard_extra_round_used")),
             "slot_coverage": self._slot_coverage(state),
             "retrieved_more": any(
                 entry.get("retrieval_plan") or entry.get("new_doc_count", 0)
@@ -1750,6 +1923,9 @@ class ReviewerPipeline(BasicPipeline):
         policy = {
             "trusted_claims": parsed.get("trusted_claims", fallback["trusted_claims"]),
             "answer_candidates": parsed.get("answer_candidates", fallback["answer_candidates"]),
+            "selected_answer_candidate": parsed.get("selected_answer_candidate", fallback.get("selected_answer_candidate")),
+            "candidate_source": parsed.get("candidate_source", fallback.get("candidate_source")),
+            "answer_type": parsed.get("answer_type", fallback.get("answer_type")),
             "ignored_docs": parsed.get("ignored_docs", fallback["ignored_docs"]),
             "conflict_resolution": parsed.get("conflict_resolution", fallback["conflict_resolution"]),
             "must_use_slots": parsed.get("must_use_slots", fallback["must_use_slots"]),
@@ -1783,7 +1959,19 @@ class ReviewerPipeline(BasicPipeline):
         adoption_policy = None
         forced_reason = None
 
-        for iteration in range(self.max_iterations):
+        for iteration in range(self.max_iterations + 1):
+            if iteration >= self.max_iterations:
+                if (
+                    evidence_state.get("guard_extra_round_pending")
+                    and not evidence_state.get("guard_extra_round_used")
+                ):
+                    evidence_state["guard_extra_round_pending"] = False
+                    evidence_state["guard_extra_round_used"] = True
+                else:
+                    break
+            elif evidence_state.get("guard_extra_round_pending"):
+                evidence_state["guard_extra_round_pending"] = False
+
             num_docs_before_review = len(current_docs)
             reviewer_prompt = self._build_evidence_review_prompt(
                 question, current_docs, evidence_state, iteration
@@ -1843,8 +2031,10 @@ class ReviewerPipeline(BasicPipeline):
                 current_docs, rank_trace = self._rank_docs_by_state(current_docs, evidence_state, return_trace=True)
                 rank_trace["iteration"] = iteration
                 diagnostic_trace["ranking_trace"].append(rank_trace)
-                adoption_policy = self._finalize_policy_with_reviewer(
-                    question, current_docs, evidence_state, review_history, forced_reason
+                adoption_policy = self._build_adoption_policy(
+                    evidence_state,
+                    current_docs,
+                    failure_reason=forced_reason,
                 )
                 break
 
@@ -1855,8 +2045,10 @@ class ReviewerPipeline(BasicPipeline):
                 current_docs, rank_trace = self._rank_docs_by_state(current_docs, evidence_state, return_trace=True)
                 rank_trace["iteration"] = iteration
                 diagnostic_trace["ranking_trace"].append(rank_trace)
-                adoption_policy = self._finalize_policy_with_reviewer(
-                    question, current_docs, evidence_state, review_history, forced_reason
+                adoption_policy = self._build_adoption_policy(
+                    evidence_state,
+                    current_docs,
+                    failure_reason=forced_reason,
                 )
                 review_history[-1]["decision"] = "force_answer"
                 review_history[-1]["failure_reason"] = forced_reason
@@ -1887,8 +2079,10 @@ class ReviewerPipeline(BasicPipeline):
                 current_docs, rank_trace = self._rank_docs_by_state(current_docs, evidence_state, return_trace=True)
                 rank_trace["iteration"] = iteration
                 diagnostic_trace["ranking_trace"].append(rank_trace)
-                adoption_policy = self._finalize_policy_with_reviewer(
-                    question, current_docs, evidence_state, review_history, forced_reason
+                adoption_policy = self._build_adoption_policy(
+                    evidence_state,
+                    current_docs,
+                    failure_reason=forced_reason,
                 )
                 diagnostic_trace["review_trace"][-1]["decision_after_merge"] = "force_answer"
                 diagnostic_trace["review_trace"][-1]["failure_reason"] = forced_reason
@@ -1901,8 +2095,10 @@ class ReviewerPipeline(BasicPipeline):
             current_docs, rank_trace = self._rank_docs_by_state(current_docs, evidence_state, return_trace=True)
             rank_trace["iteration"] = "forced"
             diagnostic_trace["ranking_trace"].append(rank_trace)
-            adoption_policy = self._finalize_policy_with_reviewer(
-                question, current_docs, evidence_state, review_history, forced_reason
+            adoption_policy = self._build_adoption_policy(
+                evidence_state,
+                current_docs,
+                failure_reason=forced_reason,
             )
             review_history.append({
                 "iteration": "forced",
@@ -2009,15 +2205,32 @@ class ReviewerPipeline(BasicPipeline):
 
         print(f"\n[3/5] Evidence review loop...")
 
-        for iteration in range(self.max_iterations):
-            active_indices = [i for i, active in enumerate(active_mask) if active]
+        for iteration in range(self.max_iterations + 1):
+            if iteration >= self.max_iterations:
+                active_indices = [
+                    i for i, active in enumerate(active_mask)
+                    if active
+                    and evidence_states[i].get("guard_extra_round_pending")
+                    and not evidence_states[i].get("guard_extra_round_used")
+                ]
+                for idx in active_indices:
+                    evidence_states[idx]["guard_extra_round_pending"] = False
+                    evidence_states[idx]["guard_extra_round_used"] = True
+            else:
+                active_indices = [i for i, active in enumerate(active_mask) if active]
+                for idx in active_indices:
+                    if evidence_states[idx].get("guard_extra_round_pending"):
+                        evidence_states[idx]["guard_extra_round_pending"] = False
             if not active_indices:
                 print(f"  All items completed at iteration {iteration}")
                 break
 
             n_active = len(active_indices)
             n_completed = n_items - n_active
-            print(f"\n  Iter {iteration + 1}/{self.max_iterations}: {n_active} active, {n_completed} done")
+            iter_label = f"{iteration + 1}/{self.max_iterations}"
+            if iteration >= self.max_iterations:
+                iter_label = "guard-extra"
+            print(f"\n  Iter {iter_label}: {n_active} active, {n_completed} done")
 
             reviewer_prompts = []
             for idx in active_indices:

@@ -15,6 +15,7 @@ Usage:
 import os
 import sys
 import argparse
+import re
 
 # Ensure the project root is in path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
@@ -31,9 +32,16 @@ def build_save_note(base_note, result_tag):
     return base_note
 
 
-def build_save_dir(dataset_name, split):
+def safe_model_dir_name(model_name):
+    name = str(model_name or "searchr1").strip().rstrip("/\\")
+    name = re.split(r"[/\\]+", name)[-1]
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    return name or "unknown-model"
+
+
+def build_save_dir(model_name, split, dataset_name):
     result_split = "dev" if split == "test" else split
-    return os.path.join("./result", result_split, dataset_name)
+    return os.path.join("./result", safe_model_dir_name(model_name), result_split, dataset_name)
 
 
 def reviewer_reasoning(args):
@@ -46,7 +54,7 @@ def reviewer_reasoning(args):
     save_note = build_save_note("reviewer-reasoning", args.result_tag)
     config_dict = {
         "save_note": save_note,
-        "save_dir": build_save_dir(args.dataset_name, args.split),
+        "save_dir": build_save_dir(args.generator_model, args.split, args.dataset_name),
         "gpu_id": args.gpu_id,
         "dataset_name": args.dataset_name,
         "split": args.split,
@@ -87,7 +95,7 @@ def reviewer_multihop(args):
     save_note = build_save_note("reviewer-multihop", args.result_tag)
     config_dict = {
         "save_note": save_note,
-        "save_dir": build_save_dir(args.dataset_name, args.split),
+        "save_dir": build_save_dir(args.generator_model, args.split, args.dataset_name),
         "gpu_id": args.gpu_id,
         "dataset_name": args.dataset_name,
         "split": args.split,
