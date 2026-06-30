@@ -19,6 +19,11 @@ from flashrag.pipeline import BasicPipeline
 from flashrag.utils import get_retriever, get_generator
 from flashrag.prompt import PromptTemplate
 
+try:
+    from reviewer_state import ReviewState, normalize_review_state
+except ImportError:
+    from examples.reviewer.reviewer_state import ReviewState, normalize_review_state
+
 
 # ============================================================================
 # Reviewer Prompt Templates
@@ -833,13 +838,17 @@ class ReviewerPipeline(BasicPipeline):
             return "final_answer" if idx == slot_count - 1 else "comparison_operand"
         return "direct_answer"
 
+    def _coerce_evidence_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize EvidenceState at pipeline boundaries while keeping dict output."""
+        return normalize_review_state(state)
+
     def _normalize_question_analysis(self, parsed: Dict[str, Any], question: str) -> Dict[str, Any]:
         valid_types = {"single_hop", "bridge", "comparison", "ambiguous"}
         question_type = parsed.get("question_type")
         if question_type not in valid_types:
             question_type = self._infer_question_type(question)
 
-        return {
+        state = {
             "question_type": question_type,
             "answer_slots": self._normalize_slots(parsed.get("answer_slots"), question, question_type),
             "claims": [],
@@ -853,6 +862,7 @@ class ReviewerPipeline(BasicPipeline):
             "explanation": parsed.get("explanation", ""),
             "round_id": 0,
         }
+        return self._coerce_evidence_state(state)
 
     def _normalize_claims(self, claims: Any, valid_slot_ids: set, round_id: int) -> List[Dict[str, Any]]:
         if not isinstance(claims, list):
@@ -987,7 +997,7 @@ class ReviewerPipeline(BasicPipeline):
             state["failure_reason"] = "parse_failure_fallback"
             state["retrieval_plan"] = []
             state["round_id"] = round_id
-            return state
+            return self._coerce_evidence_state(state)
 
         if "answer_slots" in parsed:
             slots = self._normalize_slots(
@@ -1067,7 +1077,7 @@ class ReviewerPipeline(BasicPipeline):
             else:
                 decision = "force_answer"
 
-        return {
+        state = {
             "question_type": previous_state.get("question_type", self._infer_question_type(question)),
             "answer_slots": slots,
             "claims": merged_claims,
@@ -1086,6 +1096,7 @@ class ReviewerPipeline(BasicPipeline):
             "explanation": parsed.get("explanation", ""),
             "round_id": round_id,
         }
+        return self._coerce_evidence_state(state)
 
     def _sanitize_doc_indices(self, value: Any) -> List[int]:
         if not isinstance(value, list):
@@ -1101,18 +1112,7 @@ class ReviewerPipeline(BasicPipeline):
         return sanitized
 
     def _slot_coverage(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        slots = state.get("answer_slots", [])
-        total = len(slots)
-        supported = sum(1 for slot in slots if slot.get("status") == "supported")
-        conflicted = sum(1 for slot in slots if slot.get("status") == "conflicted")
-        missing = sum(1 for slot in slots if slot.get("status") in {"missing", "partial"})
-        return {
-            "total": total,
-            "supported": supported,
-            "conflicted": conflicted,
-            "missing": missing,
-            "coverage": supported / total if total else 0.0,
-        }
+        return ReviewState.from_dict(state).slot_coverage()
 
     def _count_new_claims(self, before: Dict[str, Any], after: Dict[str, Any]) -> int:
         before_signatures = {
@@ -1124,6 +1124,41 @@ class ReviewerPipeline(BasicPipeline):
             for claim in after.get("claims", [])
             if (claim.get("doc_id"), claim.get("slot_id"), claim.get("text", "").lower()) not in before_signatures
         )
+
+    def _has_valid_retrieval_plan(self, state: Dict[str, Any]) -> bool:
+        for plan in state.get("retrieval_plan") or []:
+            if isinstance(plan, dict) and str(plan.get("query") or "").strip():
+                return True
+        return False
+
+    def _should_force_no_new_claim(
+        self,
+        state: Dict[str, Any],
+        new_claim_count: int,
+        iteration: int,
+    ) -> bool:
+        return (
+            iteration > 0
+            and new_claim_count == 0
+            and not self._has_valid_retrieval_plan(state)
+        )
+
+    def _mark_guard_extra_for_last_chance_retrieval(
+        self,
+        state: Dict[str, Any],
+        new_claim_count: int,
+        iteration: int,
+    ) -> bool:
+        if (
+            iteration == self.max_iterations - 1
+            and new_claim_count == 0
+            and state.get("decision") == "continue_retrieval"
+            and self._has_valid_retrieval_plan(state)
+            and not state.get("guard_extra_round_used")
+        ):
+            state["guard_extra_round_pending"] = True
+            return True
+        return False
 
     def _rank_docs_by_state(self, docs: List[Dict], state: Dict[str, Any], return_trace: bool = False):
         """Rank docs by slot coverage and claim support, then keep final_max_docs."""
@@ -1724,15 +1759,7 @@ class ReviewerPipeline(BasicPipeline):
 
     def _state_for_reviewer(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Keep the reviewer state compact so JSON generation is less brittle."""
-        return {
-            "question_type": state.get("question_type"),
-            "answer_type": state.get("answer_type"),
-            "answer_slots": state.get("answer_slots", []),
-            "claims": state.get("claims", [])[-16:],
-            "direct_answer_supported": bool(state.get("direct_answer_supported")),
-            "answer_candidate": state.get("answer_candidate"),
-            "round_id": state.get("round_id"),
-        }
+        return ReviewState.from_dict(state).compact_for_reviewer()
 
     def _retrieve_for_plans(
         self,
@@ -1991,6 +2018,11 @@ class ReviewerPipeline(BasicPipeline):
             ):
                 evidence_state["decision"] = "ready_to_answer"
                 evidence_state["retrieval_plan"] = []
+            self._mark_guard_extra_for_last_chance_retrieval(
+                evidence_state,
+                new_claim_count,
+                iteration,
+            )
             diagnostic_trace["review_trace"].append(self._review_step_trace(
                 iteration,
                 num_docs_before_review,
@@ -2038,7 +2070,7 @@ class ReviewerPipeline(BasicPipeline):
                 )
                 break
 
-            if new_claim_count == 0 and iteration > 0:
+            if self._should_force_no_new_claim(evidence_state, new_claim_count, iteration):
                 forced_reason = "no_new_claim"
                 evidence_state["decision"] = "force_answer"
                 evidence_state["failure_reason"] = forced_reason
@@ -2057,7 +2089,7 @@ class ReviewerPipeline(BasicPipeline):
                 break
 
             retrieval_plan = evidence_state.get("retrieval_plan", [])
-            if retrieval_plan:
+            if self._has_valid_retrieval_plan(evidence_state):
                 new_docs, retrieval_trace = self._retrieve_for_plans(
                     retrieval_plan,
                     iteration=iteration,
@@ -2272,6 +2304,11 @@ class ReviewerPipeline(BasicPipeline):
                 ):
                     evidence_states[idx]["decision"] = "ready_to_answer"
                     evidence_states[idx]["retrieval_plan"] = []
+                self._mark_guard_extra_for_last_chance_retrieval(
+                    evidence_states[idx],
+                    new_claim_count,
+                    iteration,
+                )
                 diagnostic_traces[idx]["review_trace"].append(self._review_step_trace(
                     iteration,
                     num_docs_before_review,
@@ -2328,7 +2365,7 @@ class ReviewerPipeline(BasicPipeline):
                     n_forced += 1
                     if decision == "review_failed":
                         n_failed += 1
-                elif new_claim_count == 0 and iteration > 0:
+                elif self._should_force_no_new_claim(evidence_states[idx], new_claim_count, iteration):
                     reason = "no_new_claim"
                     evidence_states[idx]["decision"] = "force_answer"
                     evidence_states[idx]["failure_reason"] = reason
@@ -2351,7 +2388,7 @@ class ReviewerPipeline(BasicPipeline):
                     n_forced += 1
                 else:
                     retrieval_plan = evidence_states[idx].get("retrieval_plan", [])
-                    if retrieval_plan:
+                    if self._has_valid_retrieval_plan(evidence_states[idx]):
                         retrieval_requests.append((idx, retrieval_plan))
                     else:
                         reason = "empty_retrieval_plan"

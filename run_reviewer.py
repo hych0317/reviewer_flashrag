@@ -20,6 +20,8 @@ import re
 # Ensure the project root is in path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
+os.environ.setdefault("HF_DATASETS_CACHE", "/data/hyc/dataset/huggingface/datasets")
+os.environ.setdefault("VLLM_CONFIG_ROOT", "/home/flyvideo/Sata2/hyc/projects/RAG/FlashRAG/.cache/vllm")
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from flashrag.config import Config

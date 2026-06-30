@@ -1,11 +1,11 @@
 # ------------------------------------------------Global Paths------------------------------------------------#
 # Paths to models
 model2path:
-  e5: "/home/flyvideo/Sata2/hyc/models/Retriever/e5-base-v2"
+  e5: "/data/hyc/models/Retriever/e5-base-v2"
   bge: "BAAI/bge-base-en-v1.5"
   contriever: "facebook/contriever"
-  llama3.1-8B-instruct: "/home/flyvideo/Sata2/hyc/models/Meta-Llama-3.1-8B-Instruct"
-  qwen2.5-7B-Instruct: "/home/flyvideo/Sata2/hyc/models/Qwen2.5-7B-Instruct"
+  llama3.1-8B-instruct: "/data/hyc/models/Meta-Llama-3.1-8B-Instruct"
+  qwen2.5-7B-Instruct: "/data/hyc/models/Qwen2.5-7B-Instruct"
   qwen3-4B-Instruct: "/home/flyvideo/Sata2/hyc/models/Qwen3-4B-Instruct"
   qwen3-8B: "/home/flyvideo/Sata2/hyc/models/Qwen3-8B"
   searchr1: "/home/flyvideo/Sata2/hyc/projects/RAG/FlashRAG/model/SearchR1-nq_hotpotqa_train-llama3.2-3b-em-grpo"
@@ -20,7 +20,7 @@ model2pooling:
 
 # Indexes path for retrieval models
 method2index:
-  e5: /home/flyvideo/Sata2/hyc/projects/RAG/FlashRAG/data/wiki_index/e5_Flat.index
+  e5: /data/hyc/dataset/wiki_index/e5_Flat.index
   bm25: ~
   contriever: ~
 
@@ -47,11 +47,11 @@ save_note: 'experiment'
 # -------------------------------------------------Retrieval Settings------------------------------------------------#
 # If set the name, the model path will be find in global paths
 retrieval_method: "e5"  # name or path of the retrieval model. 
-index_path: /home/flyvideo/Sata2/hyc/projects/RAG/FlashRAG/data/wiki_index/e5_Flat.index # set automatically if not provided. 
+index_path: /data/hyc/dataset/wiki_index/e5_Flat.index # set automatically if not provided. 
 faiss_gpu: False # whether use gpu to hold index
 faiss_gpu_id: 1 # specific GPU id for faiss index
 # corpus_path: /home/flyvideo/Sata2/hyc/datasets/FlashRAG_datasets/retrieval-corpus/domainrag_html_corpus.jsonl
-corpus_path: /home/flyvideo/Sata2/hyc/projects/RAG/FlashRAG/data/wiki18_100w.jsonl  # path to corpus in '.jsonl' format that store the documents
+corpus_path: /data/hyc/dataset/wiki18_100w.jsonl  # path to corpus in '.jsonl' format that store the documents
 
 instruction: ~ # instruction for retrieval model
 retrieval_topk: 5 # number of retrieved documents

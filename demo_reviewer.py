@@ -8,7 +8,7 @@ Usage:
     python demo_reviewer.py --model_path /path/to/model --retriever_path /path/to/retriever
 
 Example:
-    python demo_reviewer.py --num_samples 2 --model_path "/home/flyvideo/Sata2/hyc/models/Qwen3-4B-Instruct" --retriever_path "/home/flyvideo/Sata2/hyc/models/Retriever/e5-base-v2"
+    python demo_reviewer.py --num_samples 2 --model_path "/home/flyvideo/Sata2/hyc/models/Qwen3-4B-Instruct" --retriever_path "/data/hyc/models/Retriever/e5-base-v2"
 """
 
 import os
@@ -20,6 +20,8 @@ from typing import List, Dict, Any
 
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
+os.environ.setdefault("HF_DATASETS_CACHE", "/data/hyc/dataset/huggingface/datasets")
 
 
 # ============================================================================
@@ -351,15 +353,15 @@ def main():
     # Required arguments
     parser.add_argument("--model_path", type=str, default="/home/flyvideo/Sata2/hyc/models/Qwen3-4B-Instruct",
                        help="Path to generator model")
-    parser.add_argument("--retriever_path", type=str, default="/home/flyvideo/Sata2/hyc/models/Retriever/e5-base-v2",
+    parser.add_argument("--retriever_path", type=str, default="/data/hyc/models/Retriever/e5-base-v2",
                        help="Path to retriever model")
 
     # Optional arguments
     parser.add_argument("--dataset_path", type=str, default="dataset/nq/test.jsonl",
                        help="Path to dataset")
-    parser.add_argument("--index_path", type=str, default="/home/flyvideo/Sata2/hyc/projects/RAG/FlashRAG/data/wiki_index/e5_Flat.index",
+    parser.add_argument("--index_path", type=str, default="/data/hyc/dataset/wiki_index/e5_Flat.index",
                        help="Path to FAISS index")
-    parser.add_argument("--corpus_path", type=str, default="/home/flyvideo/Sata2/hyc/projects/RAG/FlashRAG/data/wiki18_100w.jsonl",
+    parser.add_argument("--corpus_path", type=str, default="/data/hyc/dataset/wiki18_100w.jsonl",
                        help="Path to corpus")
     parser.add_argument("--num_samples", type=int, default=2,
                        help="Number of samples to process")

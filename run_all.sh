@@ -6,23 +6,24 @@ set -u
 
 SCREEN_NAME="reviewer_experiments"
 GPU_ID="1"
-GENERATOR_MODEL="qwen3-8B"
+GENERATOR_MODEL="qwen2.5-7B-Instruct"
 METHOD_NAME="reviewer_reasoning"
-RESULT_TAG="ver2_3"
+RESULT_TAG="ver2_4"
 MAX_ITER="2"
 MAX_DOCS="8"
 SAMPLE_SIZE="1000"
 SPLIT_MODE="test"  # train or test
 
 DATASETS=(
-  "hotpotqa"
-  "2wikimultihopqa"
+  # "hotpotqa"
+  # "2wikimultihopqa"
   "musique"
+  "bamboogle"
   # "nq"
-  "triviaqa"
+  # "triviaqa"
   # "popqa"
   # "strategyqa"
-  "ambig_qa"
+  # "ambig_qa"
   # "asqa"
   # "fever"
 )
@@ -37,7 +38,7 @@ resolve_split() {
       ;;
     test)
       case "${dataset}" in
-        nq|popqa|triviaqa)
+        nq|popqa|triviaqa|bamboogle)
           echo "test"
           ;;
         strategyqa)
