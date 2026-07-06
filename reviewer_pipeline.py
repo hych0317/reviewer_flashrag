@@ -12,7 +12,9 @@ Reference: FlashRAG Loop-based Pipelines (IterativePipeline, IRCOTPipeline, etc.
 """
 
 import json
+import os
 import re
+import subprocess
 from typing import List, Dict, Any, Tuple, Optional
 
 from flashrag.pipeline import BasicPipeline
@@ -20,9 +22,23 @@ from flashrag.utils import get_retriever, get_generator
 from flashrag.prompt import PromptTemplate
 
 try:
-    from reviewer_state import ReviewState, normalize_review_state
+    from reviewer_state import (
+        PIPELINE_VERSION,
+        PROMPT_VERSION,
+        STATE_SCHEMA_VERSION,
+        ReviewState,
+        normalize_review_state,
+        repair_slot_claim_consistency,
+    )
 except ImportError:
-    from examples.reviewer.reviewer_state import ReviewState, normalize_review_state
+    from examples.reviewer.reviewer_state import (
+        PIPELINE_VERSION,
+        PROMPT_VERSION,
+        STATE_SCHEMA_VERSION,
+        ReviewState,
+        normalize_review_state,
+        repair_slot_claim_consistency,
+    )
 
 
 # ============================================================================
@@ -317,6 +333,15 @@ class ReviewerPipeline(BasicPipeline):
         self.max_slot_queries = self.config["reviewer_max_slot_queries"] or 3
         self.final_max_docs = min(self.max_docs, self.config["reviewer_final_max_docs"] or 8)
         self.batch_size = batch_size  # Max prompts per generate call
+        self.pipeline_version = self.config["pipeline_version"] or PIPELINE_VERSION
+        self.state_schema_version = self.config["state_schema_version"] or STATE_SCHEMA_VERSION
+        self.prompt_version = self.config["prompt_version"] or PROMPT_VERSION
+        self.enable_state_machine_executor = self.config["enable_state_machine_executor"]
+        if self.enable_state_machine_executor is None:
+            self.enable_state_machine_executor = True
+        self.enable_structured_retrieval_plan = bool(self.config["enable_structured_retrieval_plan"])
+        self.enable_answer_verifier = bool(self.config["enable_answer_verifier"])
+        self.enable_hybrid_retrieval = bool(self.config["enable_hybrid_retrieval"])
 
         # Serper fallback configuration
         self.use_serper_fallback = config["use_serper_fallback"] or False
@@ -674,6 +699,15 @@ class ReviewerPipeline(BasicPipeline):
 
     def _empty_diagnostic_trace(self) -> Dict[str, Any]:
         return {
+            "pipeline": {
+                "pipeline_version": self.pipeline_version,
+                "state_schema_version": self.state_schema_version,
+                "prompt_version": self.prompt_version,
+                "enable_state_machine_executor": bool(self.enable_state_machine_executor),
+                "enable_structured_retrieval_plan": self.enable_structured_retrieval_plan,
+                "enable_answer_verifier": self.enable_answer_verifier,
+                "enable_hybrid_retrieval": self.enable_hybrid_retrieval,
+            },
             "question_analysis": {
                 "question_type": "",
                 "slot_count": 0,
@@ -687,8 +721,71 @@ class ReviewerPipeline(BasicPipeline):
             "retrieval_trace": [],
             "ranking_trace": [],
             "gold_evidence_trace": {},
+            "verifier_trace": {},
             "final_trace": {},
         }
+
+    def _config_value(self, key: str, default: Any = None) -> Any:
+        try:
+            value = self.config[key]
+        except Exception:
+            return default
+        return default if value is None else value
+
+    def _safe_git_commit(self) -> Optional[str]:
+        try:
+            completed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return None
+        commit = completed.stdout.strip()
+        return commit or None
+
+    def _build_manifest(self, dataset_size: Optional[int] = None) -> Dict[str, Any]:
+        return {
+            "pipeline_version": self.pipeline_version,
+            "state_schema_version": self.state_schema_version,
+            "prompt_version": self.prompt_version,
+            "git_commit": self._safe_git_commit(),
+            "dataset_name": self._config_value("dataset_name"),
+            "split": self._config_value("split"),
+            "dataset_size": dataset_size,
+            "save_note": self._config_value("save_note"),
+            "model_roles": {
+                "generator_model": self._config_value("generator_model"),
+                "reviewer_model": "shared_generator" if self.reviewer is self.generator else "separate_reviewer",
+            },
+            "retrieval": {
+                "retrieval_method": self._config_value("retrieval_method"),
+                "retrieval_topk": self._config_value("retrieval_topk"),
+                "max_slot_queries": self.max_slot_queries,
+                "max_docs": self.max_docs,
+                "final_max_docs": self.final_max_docs,
+            },
+            "feature_flags": {
+                "enable_state_machine_executor": bool(self.enable_state_machine_executor),
+                "enable_structured_retrieval_plan": self.enable_structured_retrieval_plan,
+                "enable_answer_verifier": self.enable_answer_verifier,
+                "enable_hybrid_retrieval": self.enable_hybrid_retrieval,
+            },
+        }
+
+    def _write_manifest(self, dataset_size: Optional[int] = None) -> None:
+        save_dir = self._config_value("save_dir")
+        if not save_dir:
+            return
+        manifest_path = os.path.join(save_dir, "manifest.json")
+        try:
+            with open(manifest_path, "w", encoding="utf-8") as fp:
+                json.dump(self._build_manifest(dataset_size), fp, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            print(f"[Warning] Failed to save reviewer manifest: {exc}")
 
     def _question_analysis_trace(self, state: Dict[str, Any], parsed: Dict[str, Any]) -> Dict[str, Any]:
         slots = state.get("answer_slots", [])
@@ -741,6 +838,7 @@ class ReviewerPipeline(BasicPipeline):
             "guard_extra_round_pending": bool(state.get("guard_extra_round_pending")),
             "guard_extra_round_used": bool(state.get("guard_extra_round_used")),
             "failure_reason": state.get("failure_reason"),
+            "state_consistency_issues": state.get("state_consistency_issues", []),
             "parse_failed": bool(parsed.get("parse_failed") or parsed.get("retry_failed")),
             "parse_error": parsed.get("parse_error") or parsed.get("retry_error"),
             "repaired": bool(parsed.get("repaired")),
@@ -1096,6 +1194,41 @@ class ReviewerPipeline(BasicPipeline):
             "explanation": parsed.get("explanation", ""),
             "round_id": round_id,
         }
+        state, consistency_issues = repair_slot_claim_consistency(state, question=question)
+        state["state_consistency_issues"] = consistency_issues
+        if consistency_issues:
+            final_slots = [
+                slot for slot in state.get("answer_slots", [])
+                if slot.get("slot_role") in {"final_answer", "direct_answer"}
+            ]
+            final_answer_slot_ids = self._final_answer_slot_ids(state.get("answer_slots", []))
+            candidate_claim_ids = {
+                claim.get("claim_id")
+                for claim in state.get("claims", [])
+                if claim.get("slot_id") in final_answer_slot_ids
+                and claim.get("support_status") == "support"
+            }
+            if state.get("answer_candidate") and state.get("answer_candidate_claim_ids"):
+                state["direct_answer_supported"] = bool(
+                    candidate_claim_ids.intersection(state.get("answer_candidate_claim_ids") or [])
+                )
+            else:
+                state["direct_answer_supported"] = bool(final_slots) and all(
+                    slot.get("status") == "supported" for slot in final_slots
+                )
+            unresolved = [
+                slot for slot in state.get("answer_slots", [])
+                if slot.get("status") in {"missing", "partial", "conflicted"}
+            ]
+            if state.get("decision") == "ready_to_answer":
+                has_candidate = bool(state.get("answer_candidate") or state.get("answer_candidate_claim_ids"))
+                if unresolved or not state.get("direct_answer_supported") or not has_candidate:
+                    state["ready_guard_triggered"] = True
+                    if state.get("retrieval_plan") and not state.get("guard_extra_round_used"):
+                        state["guard_extra_round_pending"] = True
+                        state["decision"] = "continue_retrieval"
+                    else:
+                        state["decision"] = "force_answer"
         return self._coerce_evidence_state(state)
 
     def _sanitize_doc_indices(self, value: Any) -> List[int]:
@@ -1227,6 +1360,7 @@ class ReviewerPipeline(BasicPipeline):
         state: Dict[str, Any],
         docs: Optional[List[Dict]] = None,
         failure_reason: Optional[str] = None,
+        question: Optional[str] = None,
     ) -> Dict[str, Any]:
         trusted_claims = [
             claim for claim in state.get("claims", [])
@@ -1245,19 +1379,55 @@ class ReviewerPipeline(BasicPipeline):
             if slot.get("status") == "supported"
         ]
         answer_candidates = []
+        candidate_records = []
         answer_candidate = str(state.get("answer_candidate") or "").strip()
         if answer_candidate:
             answer_candidates.append(answer_candidate)
+            candidate_records.append({
+                "candidate": answer_candidate,
+                "source": "answer_candidate",
+                "slot_id": None,
+                "claim_id": None,
+                "claim_text": "",
+                "slot_role": "final_answer",
+            })
         final_answer_slot_ids = self._final_answer_slot_ids(state.get("answer_slots", []))
+        if not final_answer_slot_ids and state.get("question_type") == "comparison":
+            final_answer_slot_ids = {
+                slot.get("slot_id")
+                for slot in state.get("answer_slots", [])
+                if slot.get("status") == "supported"
+            }
+        slots_by_id = {slot.get("slot_id"): slot for slot in state.get("answer_slots", [])}
         for claim in trusted_claims:
             if claim.get("slot_id") not in final_answer_slot_ids:
                 continue
             candidate = self._claim_to_short_answer_candidate(claim.get("text", ""))
             if candidate and candidate not in answer_candidates:
                 answer_candidates.append(candidate)
+            if candidate:
+                slot = slots_by_id.get(claim.get("slot_id")) or {}
+                candidate_records.append({
+                    "candidate": candidate,
+                    "source": "trusted_claim",
+                    "slot_id": claim.get("slot_id"),
+                    "claim_id": claim.get("claim_id"),
+                    "claim_text": claim.get("text", ""),
+                    "slot_role": slot.get("slot_role"),
+                })
+        policy_trace = self._score_answer_candidates(
+            candidate_records,
+            answer_candidates,
+            state.get("answer_type"),
+            state.get("question_type"),
+            question,
+        )
         selected_answer_candidate = self._select_answer_candidate(
             answer_candidates,
             state.get("answer_type"),
+            state.get("question_type"),
+            question,
+            candidate_records,
         )
         compressed_answer_candidate = self._compress_short_answer(answer_candidate) if answer_candidate else None
         candidate_source = None
@@ -1267,11 +1437,16 @@ class ReviewerPipeline(BasicPipeline):
                 if selected_answer_candidate in {answer_candidate, compressed_answer_candidate}
                 else "trusted_claim"
             )
+            for record in policy_trace.get("ranked_candidates") or []:
+                if record.get("candidate") == selected_answer_candidate:
+                    candidate_source = record.get("source") or candidate_source
+                    break
         return {
             "trusted_claims": trusted_claims,
             "answer_candidates": answer_candidates[:8],
             "selected_answer_candidate": selected_answer_candidate,
             "candidate_source": candidate_source,
+            "answer_policy_trace": policy_trace,
             "answer_type": state.get("answer_type"),
             "ignored_docs": state.get("ignored_docs", []),
             "conflict_resolution": [
@@ -1377,13 +1552,31 @@ class ReviewerPipeline(BasicPipeline):
         candidates.sort(key=lambda text: (len(text.split()), len(text)))
         return candidates[0]
 
-    def _select_answer_candidate(self, candidates: List[str], answer_type: Optional[str]) -> Optional[str]:
+    def _select_answer_candidate(
+        self,
+        candidates: List[str],
+        answer_type: Optional[str],
+        question_type: Optional[str] = None,
+        question: Optional[str] = None,
+        candidate_records: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[str]:
         normalized = []
         for candidate in candidates or []:
             candidate = self._compress_short_answer(candidate) or str(candidate).strip()
             if not candidate or candidate in normalized:
                 continue
             normalized.append(candidate)
+
+        trace = self._score_answer_candidates(
+            candidate_records or [],
+            normalized,
+            answer_type,
+            question_type,
+            question,
+        )
+        ranked = trace.get("ranked_candidates") or []
+        if ranked:
+            return ranked[0].get("candidate")
 
         matching = [
             candidate for candidate in normalized
@@ -1394,6 +1587,107 @@ class ReviewerPipeline(BasicPipeline):
             return None
         pool.sort(key=lambda text: (len(text.split()), len(text)))
         return pool[0]
+
+    def _score_answer_candidates(
+        self,
+        candidate_records: List[Dict[str, Any]],
+        candidates: List[str],
+        answer_type: Optional[str],
+        question_type: Optional[str] = None,
+        question: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        seen = set()
+        records = []
+        records_by_candidate = {
+            str(record.get("candidate") or "").strip(): record
+            for record in candidate_records or []
+            if str(record.get("candidate") or "").strip()
+        }
+        for candidate in candidates or []:
+            candidate = self._compress_short_answer(candidate) or str(candidate).strip()
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            record = dict(records_by_candidate.get(candidate) or {})
+            record.setdefault("candidate", candidate)
+            record.setdefault("source", "unknown")
+            records.append(record)
+
+        q = str(question or "").lower()
+        answer_type = str(answer_type or "").lower()
+        question_type = str(question_type or "").lower()
+        ranked = []
+        filtered = []
+        for record in records:
+            candidate = str(record.get("candidate") or "").strip()
+            if not candidate:
+                continue
+            reasons = []
+            score = 0
+            if self._candidate_matches_answer_type(candidate, answer_type):
+                score += 25
+                reasons.append("answer_type_match")
+            else:
+                score -= 15
+                reasons.append("answer_type_mismatch")
+            if record.get("slot_role") in {"final_answer", "direct_answer"}:
+                score += 20
+                reasons.append("final_slot")
+            if record.get("source") == "answer_candidate":
+                score += 8
+                reasons.append("reviewer_answer_candidate")
+            overlap = self._question_candidate_overlap(candidate, q)
+            if overlap:
+                score += min(overlap * 3, 18)
+                reasons.append("question_keyword_overlap")
+            if answer_type in {"number", "date"} and re.search(r"\([^)]*\d[^)]*\)", str(record.get("claim_text") or "")):
+                score += 12
+                reasons.append("parenthetical_specificity")
+            if answer_type == "number" and re.search(r"\b(?:seat|seated|capacity|people)\b", q):
+                if re.search(r"\b(?:seated|capacity)\b", candidate, re.IGNORECASE):
+                    score += 16
+                    reasons.append("number_context_match")
+                elif re.fullmatch(r"[\d,]+", candidate):
+                    score -= 8
+                    reasons.append("bare_number_penalty")
+            if question_type == "comparison" or re.search(r"\b(which|who)\b.*\b(first|older|younger|larger|smaller|more|less)\b", q):
+                if answer_type in {"title_or_entity", "person", "location", "phrase"} and re.fullmatch(r"\d{4}(?:[-/]\d{2}[-/]\d{2})?", candidate):
+                    score -= 60
+                    reasons.append("comparison_intermediate_value_penalty")
+                if candidate.lower() in q:
+                    score += 22
+                    reasons.append("question_option_candidate")
+            score -= min(len(candidate.split()), 12)
+            ranked.append({
+                "candidate": candidate,
+                "score": score,
+                "source": record.get("source"),
+                "slot_id": record.get("slot_id"),
+                "claim_id": record.get("claim_id"),
+                "reasons": reasons,
+            })
+        ranked.sort(key=lambda item: (-item["score"], len(str(item["candidate"]).split()), len(str(item["candidate"]))))
+        return {
+            "ranked_candidates": ranked[:8],
+            "filtered_candidates": filtered,
+            "selection_reason": "highest_scored_candidate" if ranked else "no_candidate",
+        }
+
+    def _question_candidate_overlap(self, candidate: str, question_lower: str) -> int:
+        stopwords = {
+            "the", "a", "an", "of", "in", "on", "to", "for", "and", "or", "was", "were",
+            "is", "are", "what", "which", "who", "whom", "where", "when", "how", "many",
+            "much", "that", "both", "same", "first", "older", "younger", "larger", "smaller",
+        }
+        q_tokens = {
+            token for token in re.findall(r"[a-z0-9]+", question_lower)
+            if len(token) > 2 and token not in stopwords
+        }
+        c_tokens = {
+            token for token in re.findall(r"[a-z0-9]+", str(candidate or "").lower())
+            if len(token) > 2 and token not in stopwords
+        }
+        return len(q_tokens.intersection(c_tokens))
 
     def _candidate_matches_answer_type(self, candidate: str, answer_type: Optional[str]) -> bool:
         text = str(candidate or "").strip()
@@ -1419,6 +1713,22 @@ class ReviewerPipeline(BasicPipeline):
         if quoted:
             quoted.sort(key=lambda item: (len(item.split()), len(item)))
             return quoted[0].strip()
+
+        parenthetical_number = re.search(r"\(([^)]*\d[^)]*)\)", text)
+        if parenthetical_number:
+            return parenthetical_number.group(1).strip(" ,.")
+
+        office_match = re.search(
+            r"\b(?:served|serves|held|holds|appointed|was|is|became)\s+as\s+"
+            r"(?:the\s+|a\s+|an\s+)?(?:first\s+female\s+)?"
+            r"([A-Z][A-Za-z]+(?:\s+(?:of|for|and|the|[A-Z][A-Za-z]+)){0,7})",
+            text,
+        )
+        if office_match:
+            candidate = office_match.group(1).strip(" ,.")
+            candidate = re.sub(r"\s+of the United States$", "", candidate).strip(" ,.")
+            if candidate:
+                return candidate
 
         date_match = re.search(
             r"\b(?:in|on|during)\s+([A-Z][a-z]+(?:\s+\d{1,2})?,?\s+\d{4}|\d{4})\b",
@@ -1897,13 +2207,76 @@ class ReviewerPipeline(BasicPipeline):
             "final_supporting_fact_hit_count": len(final_set),
         }
 
+    def _record_review_metadata(
+        self,
+        state: Dict[str, Any],
+        previous_state: Dict[str, Any],
+        new_claim_count: int,
+    ) -> None:
+        previous_streak = int(previous_state.get("no_new_claim_streak") or 0)
+        state["no_new_claim_streak"] = previous_streak + 1 if new_claim_count == 0 else 0
+        state["query_history"] = list(previous_state.get("query_history") or state.get("query_history") or [])
+        state["last_retrieval_plan"] = list(previous_state.get("last_retrieval_plan") or [])
+        state["last_retrieval_new_doc_count"] = int(previous_state.get("last_retrieval_new_doc_count") or 0)
+        state["recovery_triggered"] = bool(previous_state.get("recovery_triggered"))
+        state["recovery_count"] = int(previous_state.get("recovery_count") or 0)
+        state["recovery_reason"] = previous_state.get("recovery_reason")
+        state["recovery_extra_round_pending"] = bool(previous_state.get("recovery_extra_round_pending"))
+        state["recovery_extra_round_used"] = bool(previous_state.get("recovery_extra_round_used"))
+        if new_claim_count == 0 and self._has_valid_retrieval_plan(state):
+            state["recovery_triggered"] = True
+            if state["no_new_claim_streak"] == 1:
+                state["recovery_count"] += 1
+            state["recovery_reason"] = state.get("recovery_reason") or "no_new_claim"
+
+    def _record_retrieval_metadata(
+        self,
+        state: Dict[str, Any],
+        retrieval_traces: List[Dict[str, Any]],
+    ) -> None:
+        if not retrieval_traces:
+            return
+        query_history = list(state.get("query_history") or [])
+        last_retrieval_plan = []
+        new_doc_count = 0
+        for trace in retrieval_traces:
+            query = str(trace.get("query") or "").strip()
+            if query and query not in query_history:
+                query_history.append(query)
+            new_count = int(trace.get("new_doc_count") or 0)
+            new_doc_count += new_count
+            last_retrieval_plan.append({
+                "slot_id": trace.get("slot_id"),
+                "query": query,
+                "reason": trace.get("reason"),
+                "new_doc_count": new_count,
+            })
+        state["query_history"] = query_history
+        state["last_retrieval_plan"] = last_retrieval_plan
+        state["last_retrieval_new_doc_count"] = new_doc_count
+
+    def _build_verifier_trace(self, state: Dict[str, Any], policy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        trusted_claims = (policy or {}).get("trusted_claims") or []
+        answer_supported = bool(state.get("direct_answer_supported"))
+        return {
+            "enabled": self.enable_answer_verifier,
+            "answer_supported": answer_supported,
+            "verified_claims": trusted_claims if self.enable_answer_verifier else [],
+            "unsupported_claims": [],
+            "verifier_failure_reason": None if self.enable_answer_verifier else "disabled",
+        }
+
     def _build_final_trace(
         self,
         pred: str,
         golden_answers: List[str],
         state: Dict[str, Any],
         review_history: List[Dict[str, Any]],
+        policy: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        selected_candidate = str((policy or {}).get("selected_answer_candidate") or "").strip()
+        normalized_pred = self._normalize_answer_for_policy_match(pred)
+        normalized_selected = self._normalize_answer_for_policy_match(selected_candidate)
         return {
             "pred": pred,
             "golden_answers": golden_answers,
@@ -1913,6 +2286,13 @@ class ReviewerPipeline(BasicPipeline):
             "answer_type": state.get("answer_type"),
             "direct_answer_supported": bool(state.get("direct_answer_supported")),
             "answer_candidate": state.get("answer_candidate"),
+            "selected_answer_candidate": selected_candidate or None,
+            "answer_policy_trace": (policy or {}).get("answer_policy_trace", {}),
+            "answer_policy_mismatch": bool(
+                normalized_selected
+                and normalized_pred
+                and normalized_selected != normalized_pred
+            ),
             "ready_guard_triggered": bool(state.get("ready_guard_triggered")),
             "guard_extra_round_used": bool(state.get("guard_extra_round_used")),
             "slot_coverage": self._slot_coverage(state),
@@ -1921,6 +2301,12 @@ class ReviewerPipeline(BasicPipeline):
                 for entry in review_history or []
             ),
         }
+
+    def _normalize_answer_for_policy_match(self, answer: Any) -> str:
+        text = str(answer or "").strip().lower()
+        text = re.sub(r"\b(the|a|an)\b", " ", text)
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        return " ".join(text.split())
 
     def _finalize_policy_with_reviewer(
         self,
@@ -1942,16 +2328,17 @@ class ReviewerPipeline(BasicPipeline):
         response = self.reviewer.generate([prompt])[0]
         parsed, error = self._parse_json_response(response)
         if parsed is None:
-            policy = self._build_adoption_policy(state, docs, failure_reason=failure_reason)
+            policy = self._build_adoption_policy(state, docs, failure_reason=failure_reason, question=question)
             policy["policy_parse_error"] = error
             return policy
 
-        fallback = self._build_adoption_policy(state, docs, failure_reason=failure_reason)
+        fallback = self._build_adoption_policy(state, docs, failure_reason=failure_reason, question=question)
         policy = {
             "trusted_claims": parsed.get("trusted_claims", fallback["trusted_claims"]),
             "answer_candidates": parsed.get("answer_candidates", fallback["answer_candidates"]),
             "selected_answer_candidate": parsed.get("selected_answer_candidate", fallback.get("selected_answer_candidate")),
             "candidate_source": parsed.get("candidate_source", fallback.get("candidate_source")),
+            "answer_policy_trace": parsed.get("answer_policy_trace", fallback.get("answer_policy_trace")),
             "answer_type": parsed.get("answer_type", fallback.get("answer_type")),
             "ignored_docs": parsed.get("ignored_docs", fallback["ignored_docs"]),
             "conflict_resolution": parsed.get("conflict_resolution", fallback["conflict_resolution"]),
@@ -2011,6 +2398,7 @@ class ReviewerPipeline(BasicPipeline):
                 evidence_state, parsed_response, question, iteration
             )
             new_claim_count = self._count_new_claims(previous_state, evidence_state)
+            self._record_review_metadata(evidence_state, previous_state, new_claim_count)
             coverage = self._slot_coverage(evidence_state)
             if (
                 evidence_state.get("decision") == "continue_retrieval"
@@ -2055,7 +2443,7 @@ class ReviewerPipeline(BasicPipeline):
                 current_docs, rank_trace = self._rank_docs_by_state(current_docs, evidence_state, return_trace=True)
                 rank_trace["iteration"] = iteration
                 diagnostic_trace["ranking_trace"].append(rank_trace)
-                adoption_policy = self._build_adoption_policy(evidence_state, current_docs)
+                adoption_policy = self._build_adoption_policy(evidence_state, current_docs, question=question)
                 break
 
             if evidence_state["decision"] in {"force_answer", "review_failed"}:
@@ -2067,6 +2455,7 @@ class ReviewerPipeline(BasicPipeline):
                     evidence_state,
                     current_docs,
                     failure_reason=forced_reason,
+                    question=question,
                 )
                 break
 
@@ -2081,6 +2470,7 @@ class ReviewerPipeline(BasicPipeline):
                     evidence_state,
                     current_docs,
                     failure_reason=forced_reason,
+                    question=question,
                 )
                 review_history[-1]["decision"] = "force_answer"
                 review_history[-1]["failure_reason"] = forced_reason
@@ -2097,6 +2487,7 @@ class ReviewerPipeline(BasicPipeline):
                     return_trace=True,
                 )
                 diagnostic_trace["retrieval_trace"].extend(retrieval_trace)
+                self._record_retrieval_metadata(evidence_state, retrieval_trace)
                 current_docs = self.merge_and_filter_docs(current_docs, new_docs, [])
                 review_history[-1]["new_doc_count"] = sum(
                     trace.get("new_doc_count", 0) for trace in retrieval_trace
@@ -2115,6 +2506,7 @@ class ReviewerPipeline(BasicPipeline):
                     evidence_state,
                     current_docs,
                     failure_reason=forced_reason,
+                    question=question,
                 )
                 diagnostic_trace["review_trace"][-1]["decision_after_merge"] = "force_answer"
                 diagnostic_trace["review_trace"][-1]["failure_reason"] = forced_reason
@@ -2131,6 +2523,7 @@ class ReviewerPipeline(BasicPipeline):
                 evidence_state,
                 current_docs,
                 failure_reason=forced_reason,
+                question=question,
             )
             review_history.append({
                 "iteration": "forced",
@@ -2164,11 +2557,15 @@ class ReviewerPipeline(BasicPipeline):
             final_docs,
             diagnostic_trace.get("retrieval_trace", []),
         )
+        verifier_trace = self._build_verifier_trace(evidence_state, adoption_policy)
+        diagnostic_trace["verifier_trace"] = verifier_trace
 
         # Store intermediate results
         item.update_output("retrieval_result", final_docs)
         item.update_output("adoption_strategy", adoption_strategy)
         item.update_output("adoption_policy", adoption_policy)
+        item.update_output("verifier_trace", verifier_trace)
+        item.update_output("answer_supported", verifier_trace.get("answer_supported"))
         item.update_output("evidence_state", evidence_state)
         item.update_output("slot_coverage", self._slot_coverage(evidence_state))
         item.update_output("failure_reason", evidence_state.get("failure_reason"))
@@ -2195,6 +2592,7 @@ class ReviewerPipeline(BasicPipeline):
             item.golden_answers,
             evidence_state,
             review_history,
+            adoption_policy,
         )
         item.update_output("diagnostic_trace", diagnostic_trace)
 
@@ -2297,6 +2695,7 @@ class ReviewerPipeline(BasicPipeline):
                     iteration,
                 )
                 new_claim_count = self._count_new_claims(previous_state, evidence_states[idx])
+                self._record_review_metadata(evidence_states[idx], previous_state, new_claim_count)
                 coverage = self._slot_coverage(evidence_states[idx])
                 if (
                     evidence_states[idx].get("decision") == "continue_retrieval"
@@ -2344,7 +2743,11 @@ class ReviewerPipeline(BasicPipeline):
                     )
                     rank_trace["iteration"] = iteration
                     diagnostic_traces[idx]["ranking_trace"].append(rank_trace)
-                    adoption_policies[idx] = self._build_adoption_policy(evidence_states[idx], current_docs[idx])
+                    adoption_policies[idx] = self._build_adoption_policy(
+                        evidence_states[idx],
+                        current_docs[idx],
+                        question=questions[idx],
+                    )
                     adoption_strategies[idx] = self._render_adoption_policy(adoption_policies[idx])
                     active_mask[idx] = False
                     n_ready += 1
@@ -2359,6 +2762,7 @@ class ReviewerPipeline(BasicPipeline):
                         evidence_states[idx],
                         current_docs[idx],
                         failure_reason=reason,
+                        question=questions[idx],
                     )
                     adoption_strategies[idx] = self._render_adoption_policy(adoption_policies[idx])
                     active_mask[idx] = False
@@ -2378,6 +2782,7 @@ class ReviewerPipeline(BasicPipeline):
                         evidence_states[idx],
                         current_docs[idx],
                         failure_reason=reason,
+                        question=questions[idx],
                     )
                     adoption_strategies[idx] = self._render_adoption_policy(adoption_policies[idx])
                     review_histories[idx][-1]["decision"] = "force_answer"
@@ -2403,6 +2808,7 @@ class ReviewerPipeline(BasicPipeline):
                             evidence_states[idx],
                             current_docs[idx],
                             failure_reason=reason,
+                            question=questions[idx],
                         )
                         adoption_strategies[idx] = self._render_adoption_policy(adoption_policies[idx])
                         review_histories[idx][-1]["decision"] = "force_answer"
@@ -2434,6 +2840,7 @@ class ReviewerPipeline(BasicPipeline):
                     print(f"    Slot re-retrieving with {len(flat_queries)} queries...")
                     flat_results = self.retriever.batch_search(flat_queries)
                     docs_by_idx = {}
+                    retrieval_traces_by_idx = {}
                     trace_seen_ids = {
                         idx: {self._safe_doc_id(doc, doc_idx) for doc_idx, doc in enumerate(current_docs[idx])}
                         for idx, _ in retrieval_requests
@@ -2449,7 +2856,7 @@ class ReviewerPipeline(BasicPipeline):
                             else:
                                 new_ids.append(doc_id)
                                 trace_seen_ids[owner_idx].add(doc_id)
-                        diagnostic_traces[owner_idx]["retrieval_trace"].append({
+                        retrieval_trace = {
                             "iteration": iteration,
                             "slot_id": plan.get("slot_id"),
                             "query": plan.get("query"),
@@ -2460,13 +2867,19 @@ class ReviewerPipeline(BasicPipeline):
                             "new_doc_ids_after_merge": new_ids,
                             "duplicate_doc_ids": duplicate_ids,
                             "new_doc_count": len(new_ids),
-                        })
+                        }
+                        diagnostic_traces[owner_idx]["retrieval_trace"].append(retrieval_trace)
+                        retrieval_traces_by_idx.setdefault(owner_idx, []).append(retrieval_trace)
 
                     for idx, new_docs in docs_by_idx.items():
                         before_ids = {doc.get("id") for doc in current_docs[idx]}
                         current_docs[idx] = self.merge_and_filter_docs(current_docs[idx], new_docs, [])
                         after_ids = {doc.get("id") for doc in current_docs[idx]}
                         review_histories[idx][-1]["new_doc_count"] = len(after_ids - before_ids)
+                        self._record_retrieval_metadata(
+                            evidence_states[idx],
+                            retrieval_traces_by_idx.get(idx, []),
+                        )
                         current_docs[idx], rank_trace = self._rank_docs_by_state(
                             current_docs[idx], evidence_states[idx], return_trace=True
                         )
@@ -2489,6 +2902,7 @@ class ReviewerPipeline(BasicPipeline):
                     evidence_states[idx],
                     current_docs[idx],
                     failure_reason=reason,
+                    question=questions[idx],
                 )
                 adoption_strategies[idx] = self._render_adoption_policy(adoption_policies[idx])
                 active_mask[idx] = False
@@ -2513,6 +2927,7 @@ class ReviewerPipeline(BasicPipeline):
                     evidence_states[idx],
                     current_docs[idx],
                     failure_reason=reason,
+                    question=questions[idx],
                 )
             if adoption_strategies[idx] is None:
                 adoption_strategies[idx] = self._render_adoption_policy(adoption_policies[idx])
@@ -2534,6 +2949,15 @@ class ReviewerPipeline(BasicPipeline):
                 current_docs[idx],
                 diagnostic_traces[idx].get("retrieval_trace", []),
             )
+        verifier_traces = []
+        answer_supported = []
+        for idx in range(n_items):
+            verifier_trace = self._build_verifier_trace(evidence_states[idx], adoption_policies[idx])
+            diagnostic_traces[idx]["verifier_trace"] = verifier_trace
+            verifier_traces.append(verifier_trace)
+            answer_supported.append(verifier_trace.get("answer_supported"))
+        dataset.update_output("verifier_trace", verifier_traces)
+        dataset.update_output("answer_supported", answer_supported)
 
         print(f"\n[5/5] Generating {n_items} final answers...")
 
@@ -2561,6 +2985,7 @@ class ReviewerPipeline(BasicPipeline):
                 dataset.data[idx].golden_answers,
                 evidence_states[idx],
                 review_histories[idx],
+                adoption_policies[idx],
             )
         dataset.update_output("diagnostic_trace", diagnostic_traces)
 
@@ -2597,6 +3022,7 @@ class ReviewerPipeline(BasicPipeline):
             dataset = FlashRAGDataset(config=dataset.config, data=sliced_data)
             print(f"Using {len(dataset)}/{original_size} samples (sample_size={sample_size})")
 
+        self._write_manifest(dataset_size=len(dataset))
         self.run_batch(dataset)
 
         dataset = self.evaluate(dataset, do_eval=do_eval, pred_process_fun=pred_process_fun)

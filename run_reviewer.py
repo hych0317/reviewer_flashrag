@@ -28,6 +28,12 @@ from flashrag.config import Config
 from flashrag.utils import get_dataset
 
 
+PIPELINE_VERSION = "ver2_5"
+DEFAULT_RESULT_TAG = "ver2_5_patch1"
+STATE_SCHEMA_VERSION = "reviewer_state_v2_5"
+PROMPT_VERSION = "reviewer_prompt_v2_5"
+
+
 def build_save_note(base_note, result_tag):
     if result_tag:
         return f"{base_note}-{result_tag}"
@@ -61,6 +67,13 @@ def reviewer_reasoning(args):
         "dataset_name": args.dataset_name,
         "split": args.split,
         "framework": "vllm",
+        "pipeline_version": PIPELINE_VERSION,
+        "state_schema_version": STATE_SCHEMA_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "enable_state_machine_executor": True,
+        "enable_structured_retrieval_plan": False,
+        "enable_answer_verifier": False,
+        "enable_hybrid_retrieval": False,
         "generator_max_input_len": 16384,
         "generation_params": {
             "max_tokens": 1024,
@@ -103,6 +116,13 @@ def reviewer_multihop(args):
         "split": args.split,
         "framework": "vllm",
         "retrieval_topk": 10,  # Retrieve more docs initially
+        "pipeline_version": PIPELINE_VERSION,
+        "state_schema_version": STATE_SCHEMA_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "enable_state_machine_executor": True,
+        "enable_structured_retrieval_plan": False,
+        "enable_answer_verifier": False,
+        "enable_hybrid_retrieval": False,
         "generator_max_input_len": 8192,
         "generation_params": {
             "max_tokens": 512,
@@ -171,11 +191,11 @@ Examples:
                         help="Maximum number of documents to keep (default: 10)")
     parser.add_argument("--reviewer_model_path", type=str, default=None,
                         help="Path to reviewer model (for reviewer_separate method)")
-    parser.add_argument("--generator_model", type=str, default=None,
+    parser.add_argument("--generator_model", type=str, default="qwen2.5-7B-Instruct",
                         help="Generator model name/path to override reviewer_config.yaml")
     parser.add_argument("--sample_size", type=int, default=3000,
                         help="Number of samples to run; use <=0 for the full split (default: 3000)")
-    parser.add_argument("--result_tag", type=str, default="",
+    parser.add_argument("--result_tag", type=str, default=DEFAULT_RESULT_TAG,
                         help="Optional suffix appended to save_note for distinguishing result directories")
 
     args = parser.parse_args()

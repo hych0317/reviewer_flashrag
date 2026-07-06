@@ -7,9 +7,15 @@ boundaries. The schema is intentionally permissive: known fields are normalized,
 unknown fields are preserved for older experiments and diagnostics.
 """
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+
+PIPELINE_VERSION = "ver2_5"
+STATE_SCHEMA_VERSION = "reviewer_state_v2_5"
+PROMPT_VERSION = "reviewer_prompt_v2_5"
 
 
 class ReviewDecision(str, Enum):
@@ -53,8 +59,16 @@ class ClaimSupportStatus(str, Enum):
 
     @classmethod
     def coerce(cls, value: Any) -> "ClaimSupportStatus":
+        normalized = str(value or "").strip()
+        legacy = {
+            "contradicted": cls.CONTRADICT.value,
+            "contradiction": cls.CONTRADICT.value,
+            "conflict": cls.CONTRADICT.value,
+            "conflicted": cls.CONTRADICT.value,
+        }
+        normalized = legacy.get(normalized, normalized)
         try:
-            return cls(str(value or "").strip())
+            return cls(normalized)
         except ValueError:
             return cls.SUPPORT
 
@@ -81,6 +95,13 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes"}
     return bool(value)
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -195,10 +216,21 @@ class RetrievalPlanItem:
 
 @dataclass
 class ReviewState:
+    pipeline_version: str = PIPELINE_VERSION
+    state_schema_version: str = STATE_SCHEMA_VERSION
     question_type: str = "single_hop"
     answer_slots: List[AnswerSlot] = field(default_factory=list)
     claims: List[EvidenceClaim] = field(default_factory=list)
     retrieval_plan: List[RetrievalPlanItem] = field(default_factory=list)
+    query_history: List[str] = field(default_factory=list)
+    last_retrieval_plan: List[RetrievalPlanItem] = field(default_factory=list)
+    last_retrieval_new_doc_count: int = 0
+    no_new_claim_streak: int = 0
+    recovery_triggered: bool = False
+    recovery_count: int = 0
+    recovery_reason: Optional[str] = None
+    recovery_extra_round_pending: bool = False
+    recovery_extra_round_used: bool = False
     decision: ReviewDecision = ReviewDecision.CONTINUE_RETRIEVAL
     answer_type: str = "phrase"
     direct_answer_supported: bool = False
@@ -218,10 +250,21 @@ class ReviewState:
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "ReviewState":
         data = data or {}
         known = {
+            "pipeline_version",
+            "state_schema_version",
             "question_type",
             "answer_slots",
             "claims",
             "retrieval_plan",
+            "query_history",
+            "last_retrieval_plan",
+            "last_retrieval_new_doc_count",
+            "no_new_claim_streak",
+            "recovery_triggered",
+            "recovery_count",
+            "recovery_reason",
+            "recovery_extra_round_pending",
+            "recovery_extra_round_used",
             "decision",
             "answer_type",
             "direct_answer_supported",
@@ -237,6 +280,8 @@ class ReviewState:
             "round_id",
         }
         return cls(
+            pipeline_version=str(data.get("pipeline_version") or PIPELINE_VERSION),
+            state_schema_version=str(data.get("state_schema_version") or STATE_SCHEMA_VERSION),
             question_type=str(data.get("question_type") or "single_hop"),
             answer_slots=[
                 AnswerSlot.from_dict(slot, idx)
@@ -257,6 +302,23 @@ class ReviewState:
                 )
                 if plan.query
             ],
+            query_history=_as_str_list(data.get("query_history")),
+            last_retrieval_plan=[
+                plan
+                for plan in (
+                    RetrievalPlanItem.from_dict(item)
+                    for item in _as_list(data.get("last_retrieval_plan"))
+                    if isinstance(item, dict)
+                )
+                if plan.query
+            ],
+            last_retrieval_new_doc_count=_as_int(data.get("last_retrieval_new_doc_count")),
+            no_new_claim_streak=_as_int(data.get("no_new_claim_streak")),
+            recovery_triggered=_as_bool(data.get("recovery_triggered")),
+            recovery_count=_as_int(data.get("recovery_count")),
+            recovery_reason=data.get("recovery_reason"),
+            recovery_extra_round_pending=_as_bool(data.get("recovery_extra_round_pending")),
+            recovery_extra_round_used=_as_bool(data.get("recovery_extra_round_used")),
             decision=ReviewDecision.coerce(data.get("decision")),
             answer_type=str(data.get("answer_type") or "phrase"),
             direct_answer_supported=_as_bool(data.get("direct_answer_supported")),
@@ -276,11 +338,23 @@ class ReviewState:
 
     def to_dict(self) -> Dict[str, Any]:
         data = dict(self.extra)
+        schema_extra_fields = sorted(key for key in data if key != "schema_extra_fields")
         data.update({
+            "pipeline_version": self.pipeline_version or PIPELINE_VERSION,
+            "state_schema_version": self.state_schema_version or STATE_SCHEMA_VERSION,
             "question_type": self.question_type,
             "answer_slots": [slot.to_dict() for slot in self.answer_slots],
             "claims": [claim.to_dict() for claim in self.claims],
             "retrieval_plan": [plan.to_dict() for plan in self.retrieval_plan],
+            "query_history": self.query_history,
+            "last_retrieval_plan": [plan.to_dict() for plan in self.last_retrieval_plan],
+            "last_retrieval_new_doc_count": self.last_retrieval_new_doc_count,
+            "no_new_claim_streak": self.no_new_claim_streak,
+            "recovery_triggered": self.recovery_triggered,
+            "recovery_count": self.recovery_count,
+            "recovery_reason": self.recovery_reason,
+            "recovery_extra_round_pending": self.recovery_extra_round_pending,
+            "recovery_extra_round_used": self.recovery_extra_round_used,
             "decision": self.decision.value,
             "answer_type": self.answer_type,
             "direct_answer_supported": self.direct_answer_supported,
@@ -294,6 +368,7 @@ class ReviewState:
             "failure_reason": self.failure_reason,
             "explanation": self.explanation,
             "round_id": self.round_id,
+            "schema_extra_fields": schema_extra_fields,
         })
         return data
 
@@ -340,3 +415,164 @@ class ReviewState:
 
 def normalize_review_state(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return ReviewState.from_dict(state).to_dict()
+
+
+def repair_slot_claim_consistency(
+    state: Optional[Dict[str, Any]],
+    question: Optional[str] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Repair deterministic slot status drift introduced by LLM slot updates.
+
+    The reviewer can emit support claims for a slot while leaving that slot as
+    missing. This helper makes the slot view consistent with the claim view
+    without changing the schema contract.
+    """
+    normalized = ReviewState.from_dict(state).to_dict()
+    support_by_slot: Dict[str, List[Dict[str, Any]]] = {}
+    conflict_by_slot: Dict[str, List[Dict[str, Any]]] = {}
+    for claim in normalized.get("claims") or []:
+        slot_id = str(claim.get("slot_id") or "")
+        claim_id = str(claim.get("claim_id") or "")
+        if not slot_id or not claim_id:
+            continue
+        status = str(claim.get("support_status") or "")
+        if status == ClaimSupportStatus.SUPPORT.value:
+            support_by_slot.setdefault(slot_id, []).append(claim)
+        elif status == ClaimSupportStatus.CONTRADICT.value:
+            conflict_by_slot.setdefault(slot_id, []).append(claim)
+
+    issues: List[Dict[str, Any]] = []
+    for slot in normalized.get("answer_slots") or []:
+        slot_id = str(slot.get("slot_id") or "")
+        if not slot_id:
+            continue
+        old_status = str(slot.get("status") or SlotStatus.MISSING.value)
+        support_claims = support_by_slot.get(slot_id, [])
+        conflict_claims = conflict_by_slot.get(slot_id, [])
+        support_ids = _dedupe_strs(
+            list(slot.get("supporting_claim_ids") or [])
+            + [claim.get("claim_id") for claim in support_claims]
+        )
+        conflict_ids = _dedupe_strs(
+            list(slot.get("conflicting_claim_ids") or [])
+            + [claim.get("claim_id") for claim in conflict_claims]
+        )
+        new_status = old_status
+        reason = None
+        blocked_reason = None
+        observed = (
+            bool(support_ids and old_status in {SlotStatus.MISSING.value, SlotStatus.PARTIAL.value})
+            or bool(support_ids and conflict_ids)
+        )
+        repair_allowed = _slot_repair_allowed(slot, support_claims, question)
+        if support_ids and conflict_ids:
+            new_status = SlotStatus.CONFLICTED.value
+            reason = "support_and_contradict_claims"
+        elif support_ids and old_status in {SlotStatus.MISSING.value, SlotStatus.PARTIAL.value}:
+            if repair_allowed:
+                new_status = SlotStatus.SUPPORTED.value
+                reason = "missing_slot_has_support_claim"
+            else:
+                blocked_reason = _slot_repair_blocked_reason(slot, support_claims, question)
+        if reason or observed:
+            issues.append({
+                "slot_id": slot_id,
+                "old_status": old_status,
+                "new_status": new_status,
+                "reason": reason or "observed_support_claim",
+                "observed": observed,
+                "repaired": bool(reason),
+                "blocked_reason": blocked_reason,
+                "supporting_claim_ids": support_ids,
+                "conflicting_claim_ids": conflict_ids,
+            })
+        slot["status"] = new_status
+        slot["supporting_claim_ids"] = support_ids
+        slot["conflicting_claim_ids"] = conflict_ids
+    return normalized, issues
+
+
+def _slot_repair_allowed(
+    slot: Dict[str, Any],
+    support_claims: List[Dict[str, Any]],
+    question: Optional[str],
+) -> bool:
+    role = str(slot.get("slot_role") or "")
+    if role not in {"final_answer", "direct_answer"}:
+        return False
+    slot_text = " ".join([
+        str(slot.get("description") or ""),
+        str(question or ""),
+    ])
+    slot_tokens = _content_tokens(slot_text)
+    if not slot_tokens:
+        return False
+    for claim in support_claims:
+        claim_text = str(claim.get("text") or "")
+        claim_tokens = _content_tokens(claim_text)
+        if not claim_tokens:
+            continue
+        overlap = slot_tokens.intersection(claim_tokens)
+        if overlap and not _looks_like_intermediate_entity_claim(claim_text, slot_text):
+            return True
+    return False
+
+
+def _slot_repair_blocked_reason(
+    slot: Dict[str, Any],
+    support_claims: List[Dict[str, Any]],
+    question: Optional[str],
+) -> str:
+    role = str(slot.get("slot_role") or "")
+    if role not in {"final_answer", "direct_answer"}:
+        return "non_final_slot"
+    slot_text = " ".join([str(slot.get("description") or ""), str(question or "")])
+    slot_tokens = _content_tokens(slot_text)
+    for claim in support_claims:
+        claim_text = str(claim.get("text") or "")
+        if not slot_tokens.intersection(_content_tokens(claim_text)):
+            continue
+        if _looks_like_intermediate_entity_claim(claim_text, slot_text):
+            return "intermediate_entity_claim"
+    return "insufficient_keyword_overlap"
+
+
+def _content_tokens(text: str) -> set:
+    stopwords = {
+        "the", "and", "or", "was", "were", "is", "are", "of", "in", "on", "at",
+        "to", "for", "by", "with", "from", "that", "this", "what", "which",
+        "who", "where", "when", "how", "did", "does", "was", "were", "person",
+        "entity", "identified", "intermediate", "final", "answer", "name",
+    }
+    return {
+        token for token in re.findall(r"[a-z0-9]+", str(text or "").lower())
+        if len(token) > 2 and token not in stopwords
+    }
+
+
+def _looks_like_intermediate_entity_claim(claim_text: str, slot_text: str) -> bool:
+    claim = str(claim_text or "").lower()
+    slot = str(slot_text or "").lower()
+    relation_markers = (
+        "organisation", "organization", "award", "place", "district", "spouse",
+        "father-in-law", "father", "mother", "county", "province", "border",
+        "educated", "volunteered", "located", "headquarter", "headquarters",
+    )
+    if any(marker in slot for marker in relation_markers):
+        if re.search(r"\b(?:is|was|were)\s+(?:the\s+)?(?:author|director|performer|spouse|father|mother|son|daughter|husband|wife)\b", claim):
+            return True
+        if re.search(r"\b(?:is|was|were)\s+(?:a|an|the)?\s*[A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){0,3}$", str(claim_text or "")):
+            return True
+    return False
+
+
+def _dedupe_strs(values: List[Any]) -> List[str]:
+    seen = set()
+    deduped = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped

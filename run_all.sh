@@ -8,26 +8,25 @@ SCREEN_NAME="reviewer_experiments"
 GPU_ID="1"
 GENERATOR_MODEL="qwen2.5-7B-Instruct"
 METHOD_NAME="reviewer_reasoning"
-RESULT_TAG="ver2_4"
-MAX_ITER="2"
-MAX_DOCS="8"
-SAMPLE_SIZE="1000"
+RESULT_TAG="ver2_5"
+MAX_ITER="3"
+MAX_DOCS="12"
+SAMPLE_SIZE="500"
 SPLIT_MODE="test"  # train or test
 
 DATASETS=(
-  # "hotpotqa"
-  # "2wikimultihopqa"
+  "hotpotqa"
+  "2wikimultihopqa"
   "musique"
   "bamboogle"
   # "nq"
-  # "triviaqa"
   # "popqa"
   # "strategyqa"
-  # "ambig_qa"
-  # "asqa"
+  # "narrativeqa"
   # "fever"
+  # "fermi"
 )
-# HotpotQA、2Wiki、MuSiQue、AmbigQA 的组合最有说服力，TriviaQA 作为 sanity check
+
 
 resolve_split() {
   local dataset="$1"

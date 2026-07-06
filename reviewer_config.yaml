@@ -89,7 +89,7 @@ serper_fallback_settings:
 
 # -------------------------------------------------Generator Settings------------------------------------------------#
 framework: vllm # inference frame work of LLM, supporting: 'hf','vllm','fschat'
-generator_model: "searchr1" # name or path of the generator model
+generator_model: "qwen2.5-7B-Instruct" # name or path of the generator model
 generator_max_input_len: 8192  # max length of the input
 generator_batch_size: 2 # batch size for generation, invalid for vllm
 generation_params:
@@ -98,6 +98,13 @@ generation_params:
 use_fid: False # whether to use FID, only valid in encoder-decoder model
 
 # -------------------------------------------------Reviewer EvidenceState Settings------------------------------------------------#
+pipeline_version: "ver2_5"
+state_schema_version: "reviewer_state_v2_5"
+prompt_version: "reviewer_prompt_v2_5"
+enable_state_machine_executor: True
+enable_structured_retrieval_plan: False
+enable_answer_verifier: False
+enable_hybrid_retrieval: False
 reviewer_max_slot_queries: 3
 reviewer_final_max_docs: 8
 
@@ -134,4 +141,3 @@ metrics: [ 'em','f1','acc','precision','recall']
 metric_setting:
   retrieval_recall_topk: 5
 save_metric_score: True #　whether to save the metric score into txt file
-
