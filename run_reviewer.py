@@ -28,10 +28,10 @@ from flashrag.config import Config
 from flashrag.utils import get_dataset
 
 
-PIPELINE_VERSION = "ver2_5"
-DEFAULT_RESULT_TAG = "ver2_5_patch1"
-STATE_SCHEMA_VERSION = "reviewer_state_v2_5"
-PROMPT_VERSION = "reviewer_prompt_v2_5"
+PIPELINE_VERSION = "ver2_7_patch2"
+DEFAULT_RESULT_TAG = "ver2_7_patch2"
+STATE_SCHEMA_VERSION = "reviewer_state_v2_7"
+PROMPT_VERSION = "reviewer_prompt_v2_7_patch2"
 
 
 def build_save_note(base_note, result_tag):
@@ -60,8 +60,10 @@ def reviewer_reasoning(args):
     such as models trained with reasoning capabilities.
     """
     save_note = build_save_note("reviewer-reasoning", args.result_tag)
+    max_iterations = args.max_iter
     config_dict = {
         "save_note": save_note,
+        "result_tag": args.result_tag,
         "save_dir": build_save_dir(args.generator_model, args.split, args.dataset_name),
         "gpu_id": args.gpu_id,
         "dataset_name": args.dataset_name,
@@ -70,10 +72,16 @@ def reviewer_reasoning(args):
         "pipeline_version": PIPELINE_VERSION,
         "state_schema_version": STATE_SCHEMA_VERSION,
         "prompt_version": PROMPT_VERSION,
+        "reviewer_max_iterations": max_iterations,
         "enable_state_machine_executor": True,
         "enable_structured_retrieval_plan": False,
         "enable_answer_verifier": False,
         "enable_hybrid_retrieval": False,
+        "enable_relation_grounding": True,
+        "relation_grounding_mode": "diagnostic",
+        "enable_comparison_executor": True,
+        "deterministic_commit_scope": "none",
+        "enable_deterministic_answer_commit": False,
         "generator_max_input_len": 16384,
         "generation_params": {
             "max_tokens": 1024,
@@ -92,7 +100,7 @@ def reviewer_reasoning(args):
 
     pipeline = ReviewerPipeline(
         config,
-        max_iterations=args.max_iter,
+        max_iterations=max_iterations,
         max_docs=args.max_docs,
     )
     result = pipeline.run(test_data, sample_size=args.sample_size)
@@ -108,8 +116,10 @@ def reviewer_multihop(args):
     for complex multi-hop reasoning tasks like HotpotQA, 2WikiMultiHopQA.
     """
     save_note = build_save_note("reviewer-multihop", args.result_tag)
+    max_iterations = max(args.max_iter, 3)
     config_dict = {
         "save_note": save_note,
+        "result_tag": args.result_tag,
         "save_dir": build_save_dir(args.generator_model, args.split, args.dataset_name),
         "gpu_id": args.gpu_id,
         "dataset_name": args.dataset_name,
@@ -119,10 +129,16 @@ def reviewer_multihop(args):
         "pipeline_version": PIPELINE_VERSION,
         "state_schema_version": STATE_SCHEMA_VERSION,
         "prompt_version": PROMPT_VERSION,
+        "reviewer_max_iterations": max_iterations,
         "enable_state_machine_executor": True,
         "enable_structured_retrieval_plan": False,
         "enable_answer_verifier": False,
         "enable_hybrid_retrieval": False,
+        "enable_relation_grounding": True,
+        "relation_grounding_mode": "diagnostic",
+        "enable_comparison_executor": True,
+        "deterministic_commit_scope": "none",
+        "enable_deterministic_answer_commit": False,
         "generator_max_input_len": 8192,
         "generation_params": {
             "max_tokens": 512,
@@ -141,7 +157,7 @@ def reviewer_multihop(args):
     # More iterations and docs for multi-hop
     pipeline = ReviewerPipeline(
         config,
-        max_iterations=max(args.max_iter, 3),  # At least 5 iterations for multi-hop
+        max_iterations=max_iterations,  # At least 3 iterations for multi-hop
         max_docs=max(args.max_docs, 10),  # Keep more documents
     )
     result = pipeline.run(test_data, sample_size=args.sample_size)

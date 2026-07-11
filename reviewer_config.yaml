@@ -98,13 +98,18 @@ generation_params:
 use_fid: False # whether to use FID, only valid in encoder-decoder model
 
 # -------------------------------------------------Reviewer EvidenceState Settings------------------------------------------------#
-pipeline_version: "ver2_5"
-state_schema_version: "reviewer_state_v2_5"
-prompt_version: "reviewer_prompt_v2_5"
+pipeline_version: "ver2_7_patch2"
+state_schema_version: "reviewer_state_v2_7"
+prompt_version: "reviewer_prompt_v2_7_patch2"
 enable_state_machine_executor: True
 enable_structured_retrieval_plan: False
 enable_answer_verifier: False
 enable_hybrid_retrieval: False
+enable_relation_grounding: True
+relation_grounding_mode: "diagnostic"
+enable_comparison_executor: True
+deterministic_commit_scope: "none"
+enable_deterministic_answer_commit: False
 reviewer_max_slot_queries: 3
 reviewer_final_max_docs: 8
 

@@ -8,10 +8,10 @@ SCREEN_NAME="reviewer_experiments"
 GPU_ID="1"
 GENERATOR_MODEL="qwen2.5-7B-Instruct"
 METHOD_NAME="reviewer_reasoning"
-RESULT_TAG="ver2_5"
+RESULT_TAG="ver2_7_patch2"
 MAX_ITER="3"
 MAX_DOCS="12"
-SAMPLE_SIZE="500"
+SAMPLE_SIZE="1000"
 SPLIT_MODE="test"  # train or test
 
 DATASETS=(

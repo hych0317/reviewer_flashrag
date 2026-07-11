@@ -13,9 +13,9 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 
-PIPELINE_VERSION = "ver2_5"
-STATE_SCHEMA_VERSION = "reviewer_state_v2_5"
-PROMPT_VERSION = "reviewer_prompt_v2_5"
+PIPELINE_VERSION = "ver2_7_patch2"
+STATE_SCHEMA_VERSION = "reviewer_state_v2_7"
+PROMPT_VERSION = "reviewer_prompt_v2_7_patch2"
 
 
 class ReviewDecision(str, Enum):
@@ -113,6 +113,10 @@ class AnswerSlot:
     status: SlotStatus = SlotStatus.MISSING
     supporting_claim_ids: List[str] = field(default_factory=list)
     conflicting_claim_ids: List[str] = field(default_factory=list)
+    target_relation: Optional[str] = None
+    relation_family: Optional[str] = None
+    expected_answer_type: Optional[str] = None
+    comparison_option: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -125,6 +129,10 @@ class AnswerSlot:
             "status",
             "supporting_claim_ids",
             "conflicting_claim_ids",
+            "target_relation",
+            "relation_family",
+            "expected_answer_type",
+            "comparison_option",
         }
         return cls(
             slot_id=str(data.get("slot_id") or f"slot_{idx + 1}"),
@@ -134,6 +142,10 @@ class AnswerSlot:
             status=SlotStatus.coerce(data.get("status")),
             supporting_claim_ids=_as_str_list(data.get("supporting_claim_ids")),
             conflicting_claim_ids=_as_str_list(data.get("conflicting_claim_ids")),
+            target_relation=data.get("target_relation"),
+            relation_family=data.get("relation_family"),
+            expected_answer_type=data.get("expected_answer_type"),
+            comparison_option=data.get("comparison_option"),
             extra={key: value for key, value in data.items() if key not in known},
         )
 
@@ -147,6 +159,10 @@ class AnswerSlot:
             "status": self.status.value,
             "supporting_claim_ids": self.supporting_claim_ids,
             "conflicting_claim_ids": self.conflicting_claim_ids,
+            "target_relation": self.target_relation,
+            "relation_family": self.relation_family,
+            "expected_answer_type": self.expected_answer_type,
+            "comparison_option": self.comparison_option,
         })
         return data
 
@@ -159,11 +175,18 @@ class EvidenceClaim:
     text: str
     support_status: ClaimSupportStatus = ClaimSupportStatus.SUPPORT
     round_id: Any = 0
+    subject: Optional[str] = None
+    predicate: Optional[str] = None
+    object: Optional[str] = None
+    object_type: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], idx: int = 0) -> "EvidenceClaim":
-        known = {"claim_id", "doc_id", "slot_id", "text", "support_status", "round_id"}
+        known = {
+            "claim_id", "doc_id", "slot_id", "text", "support_status", "round_id",
+            "subject", "predicate", "object", "object_type",
+        }
         return cls(
             claim_id=str(data.get("claim_id") or f"c{idx + 1}"),
             doc_id=str(data.get("doc_id") or ""),
@@ -171,6 +194,10 @@ class EvidenceClaim:
             text=str(data.get("text") or ""),
             support_status=ClaimSupportStatus.coerce(data.get("support_status")),
             round_id=data.get("round_id", 0),
+            subject=data.get("subject"),
+            predicate=data.get("predicate"),
+            object=data.get("object"),
+            object_type=data.get("object_type"),
             extra={key: value for key, value in data.items() if key not in known},
         )
 
@@ -183,6 +210,10 @@ class EvidenceClaim:
             "text": self.text,
             "support_status": self.support_status.value,
             "round_id": self.round_id,
+            "subject": self.subject,
+            "predicate": self.predicate,
+            "object": self.object,
+            "object_type": self.object_type,
         })
         return data
 
@@ -236,6 +267,9 @@ class ReviewState:
     direct_answer_supported: bool = False
     answer_candidate: Optional[str] = None
     answer_candidate_claim_ids: List[str] = field(default_factory=list)
+    answer_intent: Dict[str, Any] = field(default_factory=dict)
+    relation_grounding_trace: Dict[str, Any] = field(default_factory=dict)
+    answer_decision: Dict[str, Any] = field(default_factory=dict)
     ready_guard_triggered: bool = False
     guard_extra_round_pending: bool = False
     guard_extra_round_used: bool = False
@@ -270,6 +304,9 @@ class ReviewState:
             "direct_answer_supported",
             "answer_candidate",
             "answer_candidate_claim_ids",
+            "answer_intent",
+            "relation_grounding_trace",
+            "answer_decision",
             "ready_guard_triggered",
             "guard_extra_round_pending",
             "guard_extra_round_used",
@@ -325,6 +362,9 @@ class ReviewState:
             answer_candidate=str(data.get("answer_candidate")).strip()
             if data.get("answer_candidate") is not None else None,
             answer_candidate_claim_ids=_as_str_list(data.get("answer_candidate_claim_ids")),
+            answer_intent=dict(data.get("answer_intent") or {}),
+            relation_grounding_trace=dict(data.get("relation_grounding_trace") or {}),
+            answer_decision=dict(data.get("answer_decision") or {}),
             ready_guard_triggered=_as_bool(data.get("ready_guard_triggered")),
             guard_extra_round_pending=_as_bool(data.get("guard_extra_round_pending")),
             guard_extra_round_used=_as_bool(data.get("guard_extra_round_used")),
@@ -360,6 +400,9 @@ class ReviewState:
             "direct_answer_supported": self.direct_answer_supported,
             "answer_candidate": self.answer_candidate,
             "answer_candidate_claim_ids": self.answer_candidate_claim_ids,
+            "answer_intent": self.answer_intent,
+            "relation_grounding_trace": self.relation_grounding_trace,
+            "answer_decision": self.answer_decision,
             "ready_guard_triggered": self.ready_guard_triggered,
             "guard_extra_round_pending": self.guard_extra_round_pending,
             "guard_extra_round_used": self.guard_extra_round_used,
@@ -409,6 +452,7 @@ class ReviewState:
             "claims": [claim.to_dict() for claim in self.claims[-claim_limit:]],
             "direct_answer_supported": self.direct_answer_supported,
             "answer_candidate": self.answer_candidate,
+            "answer_intent": self.answer_intent,
             "round_id": self.round_id,
         }
 

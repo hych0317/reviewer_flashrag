@@ -14,6 +14,7 @@ Usage:
 import argparse
 import glob
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -33,6 +34,18 @@ def output_of(item: Dict[str, Any]) -> Dict[str, Any]:
 
 def metric_of(item: Dict[str, Any]) -> Dict[str, float]:
     return output_of(item).get("metric_score", {}) or {}
+
+
+def normalized_answer(value: Any) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold())
+    return " ".join(token for token in text.split() if token not in {"a", "an", "the"})
+
+
+def candidate_is_gold(item: Dict[str, Any], candidate: Any) -> bool:
+    normalized = normalized_answer(candidate)
+    return bool(normalized) and normalized in {
+        normalized_answer(answer) for answer in item.get("golden_answers") or []
+    }
 
 
 def diagnostic_of(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -194,6 +207,53 @@ def answer_policy_mismatch(item: Dict[str, Any]) -> bool:
     return bool(final_trace.get("answer_policy_mismatch"))
 
 
+def chain_grounding_trace_of(item: Dict[str, Any]) -> Dict[str, Any]:
+    output = output_of(item)
+    trace = diagnostic_of(item)
+    final_trace = trace.get("final_trace") or {}
+    candidates = [
+        trace.get("chain_grounding_trace"),
+        final_trace.get("chain_grounding_trace"),
+        (output.get("adoption_policy") or {}).get("chain_grounding_trace"),
+        (output.get("evidence_state") or {}).get("chain_grounding_trace"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    return {}
+
+
+def relation_grounding_trace_of(item: Dict[str, Any]) -> Dict[str, Any]:
+    output = output_of(item)
+    trace = diagnostic_of(item)
+    final_trace = trace.get("final_trace") or {}
+    candidates = [
+        trace.get("relation_grounding_trace"),
+        final_trace.get("relation_grounding_trace"),
+        (output.get("adoption_policy") or {}).get("relation_grounding_trace"),
+        (output.get("evidence_state") or {}).get("relation_grounding_trace"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    return {}
+
+
+def answer_decision_of(item: Dict[str, Any]) -> Dict[str, Any]:
+    output = output_of(item)
+    trace = diagnostic_of(item)
+    final_trace = trace.get("final_trace") or {}
+    for candidate in (
+        trace.get("answer_decision"),
+        final_trace.get("answer_decision"),
+        (output.get("adoption_policy") or {}).get("answer_decision"),
+        (output.get("evidence_state") or {}).get("answer_decision"),
+    ):
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+    return {}
+
+
 def consistency_issue_repaired(issue: Dict[str, Any]) -> bool:
     if "repaired" in issue:
         return bool(issue.get("repaired"))
@@ -225,6 +285,7 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
     answer_types = Counter()
     repair_methods = Counter()
     candidate_sources = Counter()
+    candidate_source_by_chain_grounding = Counter()
     pipeline_versions = Counter()
     state_schema_versions = Counter()
     guard_extra_used = 0
@@ -243,6 +304,42 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
     state_consistency_observed = 0
     state_consistency_blocked = 0
     state_consistency_blocked_reasons = Counter()
+    chain_trace_count = 0
+    chain_grounded_count = 0
+    chain_coverage_sum = 0.0
+    chain_coverage_count = 0
+    ungrounded_high_coverage_wrong = 0
+    max_rounds_null_wrong = 0
+    relation_trace_count = 0
+    relation_grounded_count = 0
+    semantic_coverage_sum = 0.0
+    semantic_ready_wrong = 0
+    grounded_but_relation_mismatch = 0
+    comparison_executed = 0
+    comparison_executed_correct = 0
+    deterministic_commit = 0
+    deterministic_commit_correct = 0
+    policy_mismatch_by_commit_mode = Counter()
+    high_coverage_wrong_by_operation = Counter()
+    candidate_source_by_operation = Counter()
+    control_actions = Counter()
+    intent_sources = Counter()
+    operand_binding_statuses = Counter()
+    intent_conflicts = 0
+    strict_comparison_executable = 0
+    strict_comparison_correct = 0
+    counterfactual_candidates = 0
+    counterfactual_correct = 0
+    would_commit_under_v2_7 = 0
+    forced_by_relation_guard = 0
+    generated_without_validated_candidate = 0
+    question_type_repaired = 0
+    entity_binding_valid = 0
+    diagnostic_candidate_leakage = 0
+    semantic_guidance_applied = 0
+    provenance_rebind_candidates = 0
+    date_precision_mismatch = 0
+    binding_directions = Counter()
 
     for item in items:
         trace = diagnostic_of(item)
@@ -263,6 +360,10 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
                 adaptive_gold_hits += 1
 
         state = output_of(item).get("evidence_state") or {}
+        final_trace = trace.get("final_trace") or {}
+        question_type_repaired += int(bool(
+            final_trace.get("question_type_repaired") or state.get("question_type_repaired")
+        ))
         state_schema_versions[str(state.get("state_schema_version") or "unknown")] += 1
         answer_type = state.get("answer_type")
         if answer_type:
@@ -288,8 +389,82 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
             slot_statuses[str(slot.get("status") or "unknown")] += 1
 
         policy = output_of(item).get("adoption_policy") or {}
+        candidate_source = str(policy.get("candidate_source") or "null")
         if policy.get("candidate_source"):
-            candidate_sources[str(policy.get("candidate_source"))] += 1
+            candidate_sources[candidate_source] += 1
+        chain_trace = chain_grounding_trace_of(item)
+        if chain_trace:
+            chain_trace_count += 1
+            chain_grounded = bool(chain_trace.get("chain_grounded"))
+            if chain_grounded:
+                chain_grounded_count += 1
+            if "chain_coverage" in chain_trace:
+                chain_coverage_sum += float(chain_trace.get("chain_coverage") or 0.0)
+                chain_coverage_count += 1
+            chain_bucket = "grounded" if chain_grounded else "ungrounded"
+        else:
+            chain_bucket = "unknown"
+        candidate_source_by_chain_grounding[f"{chain_bucket}:{candidate_source}"] += 1
+
+        relation_trace = relation_grounding_trace_of(item)
+        answer_decision = answer_decision_of(item)
+        operation = str(
+            (relation_trace.get("answer_intent") or {}).get("operation")
+            or ((state.get("answer_intent") or {}).get("operation"))
+            or "unknown"
+        )
+        commit_mode = str(answer_decision.get("commit_mode") or "unknown")
+        candidate_source_by_operation[f"{operation}:{candidate_source}"] += 1
+        if relation_trace:
+            relation_trace_count += 1
+            if relation_trace.get("relation_grounded"):
+                relation_grounded_count += 1
+            semantic_coverage_sum += float(relation_trace.get("semantic_coverage") or 0.0)
+            if relation_trace.get("grounded_but_wrong_relation"):
+                grounded_but_relation_mismatch += 1
+            control_actions[str(relation_trace.get("control_action") or "unknown")] += 1
+            intent_sources[str(relation_trace.get("intent_source") or "unknown")] += 1
+            operand_binding_statuses[str(relation_trace.get("operand_binding_status") or "unknown")] += 1
+            intent_conflicts += int(bool(relation_trace.get("intent_conflict")))
+            strict = bool(relation_trace.get("strict_comparison_executable"))
+            strict_comparison_executable += int(strict)
+            counterfactual = relation_trace.get("counterfactual_answer_candidate")
+            if counterfactual:
+                counterfactual_candidates += 1
+                counterfactual_correct += int(candidate_is_gold(item, counterfactual))
+                strict_comparison_correct += int(strict and candidate_is_gold(item, counterfactual))
+            would_commit_under_v2_7 += int(bool(relation_trace.get("would_commit_under_v2_7")))
+            final_trace = trace.get("final_trace") or {}
+            forced_by_relation_guard += int(bool(
+                relation_trace.get("forced_by_relation_guard")
+                or final_trace.get("forced_by_relation_guard")
+                or trace.get("forced_by_relation_guard")
+            ))
+            generated_without_validated_candidate += int(bool(
+                relation_trace.get("generated_without_validated_candidate")
+                or final_trace.get("generated_without_validated_candidate")
+                or trace.get("generated_without_validated_candidate")
+            ))
+            entity_binding_valid += int(bool(relation_trace.get("entity_binding_valid")))
+            for direction in relation_trace.get("binding_directions") or []:
+                binding_directions[str(direction)] += 1
+            diagnostic_candidate_leakage += int(bool(
+                final_trace.get("diagnostic_candidate_leakage")
+                or trace.get("diagnostic_candidate_leakage")
+            ))
+            semantic_guidance_applied += int(bool(
+                final_trace.get("semantic_guidance_applied")
+                or trace.get("semantic_guidance_applied")
+            ))
+            comparison = relation_trace.get("comparison_execution") or {}
+            for lineage in comparison.get("comparison_lineage") or []:
+                provenance_rebind_candidates += int(bool(
+                    lineage.get("alternative_intermediate_provenance_doc_ids")
+                    or lineage.get("alternative_value_provenance_doc_ids")
+                ))
+            date_precision_mismatch += int(
+                "operand_date_precision_mismatch" in (comparison.get("rejection_reasons") or [])
+            )
 
         verifier = output_of(item).get("verifier_trace") or trace.get("verifier_trace") or {}
         if verifier.get("enabled"):
@@ -320,8 +495,18 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
         f1 = float(metric.get("f1", 0.0))
         if answer_policy_mismatch(item):
             policy_mismatch += 1
+            policy_mismatch_by_commit_mode[commit_mode] += 1
             if f1 == 0:
                 policy_mismatch_wrong += 1
+        if relation_trace.get("relation_grounded") and float(relation_trace.get("semantic_coverage") or 0.0) >= 0.99 and f1 == 0:
+            semantic_ready_wrong += 1
+        comparison_status = str(relation_trace.get("comparison_execution_status") or "")
+        if comparison_status == "executed":
+            comparison_executed += 1
+            comparison_executed_correct += int(f1 > 0)
+        if commit_mode == "deterministic_commit":
+            deterministic_commit += 1
+            deterministic_commit_correct += int(f1 > 0)
         if bucket == "gold_added_by_adaptive" and f1 > 0:
             case_candidates["adaptive_added_gold_answered"] += 1
         if gold.get("final_gold_title_recall", 0.0) > 0 and f1 == 0:
@@ -329,8 +514,17 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
         if coverage.get("coverage", 0.0) >= 0.99 and f1 == 0:
             case_candidates["high_coverage_but_wrong"] += 1
             high_coverage_wrong_by_answer_type[str(answer_type or "unknown")] += 1
+            high_coverage_wrong_by_operation[operation] += 1
+            if chain_trace and not chain_trace.get("chain_grounded"):
+                ungrounded_high_coverage_wrong += 1
+                case_candidates["high_coverage_ungrounded_wrong"] += 1
         if forced and bucket == "gold_not_found":
             case_candidates["forced_gold_missing"] += 1
+        if gold.get("final_gold_title_recall", 0.0) > 0 and f1 == 0 and chain_trace and not chain_trace.get("chain_grounded"):
+            case_candidates["retrieved_gold_ungrounded_wrong"] += 1
+        if failure_reason_of(item) == "max_rounds" and candidate_source == "null" and f1 == 0:
+            max_rounds_null_wrong += 1
+            case_candidates["max_rounds_null_wrong"] += 1
 
     print("\ndiagnostic_summary")
     print(f"traced_items\t{traced}")
@@ -347,6 +541,32 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
         print(f"state_consistency_blocked_rate\t{state_consistency_blocked / traced:.4f}")
         print(f"policy_mismatch_rate\t{policy_mismatch / traced:.4f}")
         print(f"policy_mismatch_wrong\t{policy_mismatch_wrong}")
+        print(f"chain_grounded_rate\t{chain_grounded_count / chain_trace_count:.4f}" if chain_trace_count else "chain_grounded_rate\t0.0000")
+        print(f"chain_coverage_avg\t{chain_coverage_sum / chain_coverage_count:.4f}" if chain_coverage_count else "chain_coverage_avg\t0.0000")
+        print(f"ungrounded_high_coverage_wrong\t{ungrounded_high_coverage_wrong}")
+        print(f"max_rounds_null_wrong\t{max_rounds_null_wrong}")
+        print(f"relation_grounded_rate\t{relation_grounded_count / relation_trace_count:.4f}" if relation_trace_count else "relation_grounded_rate\t0.0000")
+        print(f"semantic_coverage_avg\t{semantic_coverage_sum / relation_trace_count:.4f}" if relation_trace_count else "semantic_coverage_avg\t0.0000")
+        print(f"semantic_ready_wrong\t{semantic_ready_wrong}")
+        print(f"grounded_but_relation_mismatch\t{grounded_but_relation_mismatch}")
+        print(f"comparison_executor_coverage\t{comparison_executed / traced:.4f}")
+        print(f"comparison_executor_accuracy\t{comparison_executed_correct / comparison_executed:.4f}" if comparison_executed else "comparison_executor_accuracy\t0.0000")
+        print(f"deterministic_commit_rate\t{deterministic_commit / traced:.4f}")
+        print(f"deterministic_commit_accuracy\t{deterministic_commit_correct / deterministic_commit:.4f}" if deterministic_commit else "deterministic_commit_accuracy\t0.0000")
+        print(f"intent_conflict_rate\t{intent_conflicts / traced:.4f}")
+        print(f"strict_comparison_executable_rate\t{strict_comparison_executable / traced:.4f}")
+        print(f"strict_comparison_counterfactual_accuracy\t{strict_comparison_correct / strict_comparison_executable:.4f}" if strict_comparison_executable else "strict_comparison_counterfactual_accuracy\t0.0000")
+        print(f"counterfactual_candidate_rate\t{counterfactual_candidates / traced:.4f}")
+        print(f"counterfactual_candidate_accuracy\t{counterfactual_correct / counterfactual_candidates:.4f}" if counterfactual_candidates else "counterfactual_candidate_accuracy\t0.0000")
+        print(f"would_commit_under_v2_7_rate\t{would_commit_under_v2_7 / traced:.4f}")
+        print(f"forced_by_relation_guard_rate\t{forced_by_relation_guard / traced:.4f}")
+        print(f"generated_without_validated_candidate_rate\t{generated_without_validated_candidate / traced:.4f}")
+        print(f"question_type_repaired_rate\t{question_type_repaired / traced:.4f}")
+        print(f"entity_binding_valid_rate\t{entity_binding_valid / traced:.4f}")
+        print(f"diagnostic_candidate_leakage_rate\t{diagnostic_candidate_leakage / traced:.4f}")
+        print(f"semantic_guidance_applied_rate\t{semantic_guidance_applied / traced:.4f}")
+        print(f"provenance_rebind_candidates\t{provenance_rebind_candidates}")
+        print(f"date_precision_mismatch\t{date_precision_mismatch}")
         total_answer_support = answer_supported_count + answer_unsupported_count
         print(f"answer_unsupported_rate\t{answer_unsupported_count / total_answer_support:.4f}" if total_answer_support else "answer_unsupported_rate\t0.0000")
         print(f"verifier_enabled_rate\t{verifier_enabled_count / traced:.4f}")
@@ -356,8 +576,16 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
     print_counter("answer_types", answer_types)
     print_counter("repair_methods", repair_methods)
     print_counter("candidate_sources", candidate_sources)
+    print_counter("candidate_source_by_chain_grounding", candidate_source_by_chain_grounding)
+    print_counter("candidate_source_by_operation", candidate_source_by_operation)
+    print_counter("control_actions", control_actions)
+    print_counter("intent_sources", intent_sources)
+    print_counter("operand_binding_statuses", operand_binding_statuses)
+    print_counter("binding_directions", binding_directions)
+    print_counter("policy_mismatch_by_commit_mode", policy_mismatch_by_commit_mode)
     print_counter("state_consistency_blocked_reasons", state_consistency_blocked_reasons)
     print_counter("high_coverage_wrong_by_answer_type", high_coverage_wrong_by_answer_type)
+    print_counter("high_coverage_wrong_by_operation", high_coverage_wrong_by_operation)
     print_counter("case_study_candidates", case_candidates)
 
 

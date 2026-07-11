@@ -12,6 +12,7 @@ Reference: FlashRAG Loop-based Pipelines (IterativePipeline, IRCOTPipeline, etc.
 """
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -38,6 +39,23 @@ except ImportError:
         ReviewState,
         normalize_review_state,
         repair_slot_claim_consistency,
+    )
+
+try:
+    from reviewer_answer_semantics import (
+        annotate_slots_with_intent,
+        build_answer_intent,
+        evaluate_answer_semantics,
+        infer_effective_question_type,
+        repair_answer_slot_topology,
+    )
+except ImportError:
+    from examples.reviewer.reviewer_answer_semantics import (
+        annotate_slots_with_intent,
+        build_answer_intent,
+        evaluate_answer_semantics,
+        infer_effective_question_type,
+        repair_answer_slot_topology,
     )
 
 
@@ -68,12 +86,24 @@ Output only valid JSON:
 ```json
 {{
     "question_type": "single_hop | bridge | comparison | ambiguous",
+    "answer_intent": {{
+        "operation": "direct_lookup | bridge_lookup | compare_min | compare_max | compare_equal | unknown",
+        "target_relation": "short relation requested by the question",
+        "relation_family": "normalized relation family",
+        "answer_role": "object | option | boolean",
+        "expected_answer_type": "yes_no | person | date | location | title_or_entity | number | phrase",
+        "option_entities": []
+    }},
     "answer_slots": [
         {{
             "slot_id": "slot_1",
             "description": "specific fact needed to answer",
             "slot_role": "intermediate_entity | final_answer | comparison_operand | direct_answer",
             "depends_on": [],
+            "target_relation": "relation required by this slot",
+            "relation_family": "normalized relation family",
+            "expected_answer_type": "expected object type",
+            "comparison_option": null,
             "status": "missing",
             "supporting_claim_ids": [],
             "conflicting_claim_ids": []
@@ -127,6 +157,10 @@ Output format:
             "doc_id": "document id from the prompt",
             "slot_id": "slot_1",
             "text": "atomic factual claim",
+            "subject": "claim subject or null",
+            "predicate": "claim relation or null",
+            "object": "claim object/value or null",
+            "object_type": "person | date | location | title_or_entity | number | phrase | null",
             "support_status": "support | contradict | irrelevant",
             "round_id": 0
         }}
@@ -342,6 +376,20 @@ class ReviewerPipeline(BasicPipeline):
         self.enable_structured_retrieval_plan = bool(self.config["enable_structured_retrieval_plan"])
         self.enable_answer_verifier = bool(self.config["enable_answer_verifier"])
         self.enable_hybrid_retrieval = bool(self.config["enable_hybrid_retrieval"])
+        relation_flag = self._config_value("enable_relation_grounding", True)
+        comparison_flag = self._config_value("enable_comparison_executor", True)
+        relation_mode = str(self._config_value("relation_grounding_mode", "diagnostic") or "diagnostic")
+        if relation_mode not in {"diagnostic", "control"}:
+            relation_mode = "diagnostic"
+        commit_scope = str(self._config_value("deterministic_commit_scope", "none") or "none")
+        if commit_scope not in {"none", "strict_comparison"}:
+            commit_scope = "none"
+        commit_flag = self._config_value("enable_deterministic_answer_commit", False)
+        self.enable_relation_grounding = bool(relation_flag)
+        self.relation_grounding_mode = relation_mode
+        self.enable_comparison_executor = bool(comparison_flag)
+        self.deterministic_commit_scope = commit_scope
+        self.enable_deterministic_answer_commit = bool(commit_flag) and commit_scope != "none"
 
         # Serper fallback configuration
         self.use_serper_fallback = config["use_serper_fallback"] or False
@@ -707,9 +755,18 @@ class ReviewerPipeline(BasicPipeline):
                 "enable_structured_retrieval_plan": self.enable_structured_retrieval_plan,
                 "enable_answer_verifier": self.enable_answer_verifier,
                 "enable_hybrid_retrieval": self.enable_hybrid_retrieval,
+                "enable_relation_grounding": self.enable_relation_grounding,
+                "relation_grounding_mode": self.relation_grounding_mode,
+                "enable_comparison_executor": self.enable_comparison_executor,
+                "deterministic_commit_scope": self.deterministic_commit_scope,
+                "enable_deterministic_answer_commit": self.enable_deterministic_answer_commit,
             },
             "question_analysis": {
                 "question_type": "",
+                "original_question_type": "",
+                "effective_question_type": "",
+                "question_type_repaired": False,
+                "question_type_repair_reason": None,
                 "slot_count": 0,
                 "slot_descriptions": [],
                 "parse_failed": False,
@@ -720,10 +777,61 @@ class ReviewerPipeline(BasicPipeline):
             "review_trace": [],
             "retrieval_trace": [],
             "ranking_trace": [],
+            "chain_grounding_trace": {},
+            "relation_grounding_trace": {},
+            "answer_decision": {},
             "gold_evidence_trace": {},
             "verifier_trace": {},
             "final_trace": {},
         }
+
+    def _attach_policy_diagnostics(
+        self,
+        diagnostic_trace: Dict[str, Any],
+        policy: Optional[Dict[str, Any]],
+    ) -> None:
+        policy = policy or {}
+        relation_trace = policy.get("relation_grounding_trace") or {}
+        answer_decision = policy.get("answer_decision") or {}
+        diagnostic_trace["chain_grounding_trace"] = policy.get("chain_grounding_trace", {})
+        diagnostic_trace["relation_grounding_trace"] = relation_trace
+        diagnostic_trace["answer_decision"] = answer_decision
+        for key in (
+            "relation_grounded",
+            "semantic_coverage",
+            "subject_grounded",
+            "target_relation_match",
+            "candidate_role_valid",
+            "candidate_answer_type_match",
+            "candidate_is_question_entity",
+            "candidate_is_intermediate_entity",
+            "grounded_but_wrong_relation",
+            "comparison_execution_status",
+            "intent_source",
+            "intent_conflict",
+            "operand_binding_status",
+            "comparison_lineage",
+            "strict_comparison_executable",
+            "counterfactual_answer_candidate",
+            "counterfactual_candidate_source",
+            "would_commit_under_v2_7",
+            "generated_without_validated_candidate",
+            "entity_binding_valid",
+            "binding_directions",
+        ):
+            diagnostic_trace[key] = relation_trace.get(key)
+        diagnostic_trace["control_action"] = relation_trace.get("control_action", "diagnostic_only")
+        diagnostic_trace["forced_by_relation_guard"] = bool(
+            (policy.get("failure_reason") or "") == "relation_ungrounded_final_slot"
+        )
+        diagnostic_trace["generated_without_validated_candidate"] = bool(
+            policy.get("generated_without_validated_candidate")
+        )
+        diagnostic_trace["semantic_guidance_applied"] = bool(policy.get("semantic_guidance_applied"))
+        diagnostic_trace["diagnostic_candidate_leakage"] = bool(policy.get("diagnostic_candidate_leakage"))
+        diagnostic_trace["commit_mode"] = answer_decision.get("commit_mode")
+        diagnostic_trace["commit_reason"] = answer_decision.get("commit_reason")
+        diagnostic_trace["committed_claim_ids"] = answer_decision.get("committed_claim_ids") or []
 
     def _config_value(self, key: str, default: Any = None) -> Any:
         try:
@@ -747,16 +855,52 @@ class ReviewerPipeline(BasicPipeline):
         commit = completed.stdout.strip()
         return commit or None
 
+    def _safe_git_dirty(self) -> Optional[bool]:
+        try:
+            completed = subprocess.run(
+                ["git", "status", "--porcelain", "--", "examples/reviewer"],
+                cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return None
+        return bool(completed.stdout.strip()) if completed.returncode == 0 else None
+
+    def _code_fingerprint(self) -> Optional[str]:
+        base_dir = os.path.dirname(__file__)
+        filenames = (
+            "reviewer_state.py", "reviewer_answer_semantics.py", "reviewer_pipeline.py",
+            "run_reviewer.py", "run_all.sh", "reviewer_config.yaml",
+            "analyze_reviewer_results.py",
+        )
+        digest = hashlib.sha256()
+        try:
+            for filename in filenames:
+                path = os.path.join(base_dir, filename)
+                digest.update(filename.encode("utf-8"))
+                with open(path, "rb") as fp:
+                    digest.update(fp.read())
+        except OSError:
+            return None
+        return digest.hexdigest()
+
     def _build_manifest(self, dataset_size: Optional[int] = None) -> Dict[str, Any]:
         return {
             "pipeline_version": self.pipeline_version,
             "state_schema_version": self.state_schema_version,
             "prompt_version": self.prompt_version,
             "git_commit": self._safe_git_commit(),
+            "git_dirty": self._safe_git_dirty(),
+            "code_fingerprint": self._code_fingerprint(),
             "dataset_name": self._config_value("dataset_name"),
             "split": self._config_value("split"),
             "dataset_size": dataset_size,
             "save_note": self._config_value("save_note"),
+            "result_tag": self._config_value("result_tag"),
+            "max_iterations": self.max_iterations,
             "model_roles": {
                 "generator_model": self._config_value("generator_model"),
                 "reviewer_model": "shared_generator" if self.reviewer is self.generator else "separate_reviewer",
@@ -773,6 +917,11 @@ class ReviewerPipeline(BasicPipeline):
                 "enable_structured_retrieval_plan": self.enable_structured_retrieval_plan,
                 "enable_answer_verifier": self.enable_answer_verifier,
                 "enable_hybrid_retrieval": self.enable_hybrid_retrieval,
+                "enable_relation_grounding": self.enable_relation_grounding,
+                "relation_grounding_mode": self.relation_grounding_mode,
+                "enable_comparison_executor": self.enable_comparison_executor,
+                "deterministic_commit_scope": self.deterministic_commit_scope,
+                "enable_deterministic_answer_commit": self.enable_deterministic_answer_commit,
             },
         }
 
@@ -794,7 +943,12 @@ class ReviewerPipeline(BasicPipeline):
             raw_response = parsed.get("raw_response") or parsed.get("retry_response")
         return {
             "question_type": state.get("question_type", ""),
+            "original_question_type": state.get("original_question_type", state.get("question_type", "")),
+            "effective_question_type": state.get("question_type", ""),
+            "question_type_repaired": bool(state.get("question_type_repaired")),
+            "question_type_repair_reason": state.get("question_type_repair_reason"),
             "answer_type": state.get("answer_type"),
+            "answer_intent": state.get("answer_intent", {}),
             "slot_count": len(slots),
             "slot_descriptions": [slot.get("description", "") for slot in slots],
             "slot_roles": [slot.get("slot_role", "") for slot in slots],
@@ -839,6 +993,11 @@ class ReviewerPipeline(BasicPipeline):
             "guard_extra_round_used": bool(state.get("guard_extra_round_used")),
             "failure_reason": state.get("failure_reason"),
             "state_consistency_issues": state.get("state_consistency_issues", []),
+            "chain_grounding_trace": state.get("chain_grounding_trace", {}),
+            "chain_grounded": bool((state.get("chain_grounding_trace") or {}).get("chain_grounded")),
+            "chain_coverage": (state.get("chain_grounding_trace") or {}).get("chain_coverage"),
+            "relation_grounding_trace": state.get("relation_grounding_trace", {}),
+            "answer_decision": state.get("answer_decision", {}),
             "parse_failed": bool(parsed.get("parse_failed") or parsed.get("retry_failed")),
             "parse_error": parsed.get("parse_error") or parsed.get("retry_error"),
             "repaired": bool(parsed.get("repaired")),
@@ -848,7 +1007,12 @@ class ReviewerPipeline(BasicPipeline):
 
     def _infer_question_type(self, question: str) -> str:
         q = question.lower()
-        comparison_markers = ["both", "same", "older", "younger", "larger", "smaller", "more", "less", "compare"]
+        comparison_markers = [
+            "both", "same", "first", "earlier", "later", "older", "younger",
+            "larger", "smaller", "more", "less", "compare", "most recently",
+            "most recent", "latest", "newer", "newest", "oldest", "highest",
+            "lowest", "longer", "shorter", "fewer",
+        ]
         bridge_markers = ["who", "what", "where", "when", "which"]
         if any(marker in q for marker in comparison_markers):
             return "comparison"
@@ -903,7 +1067,9 @@ class ReviewerPipeline(BasicPipeline):
 
     def _normalize_slots(self, slots: Any, question: str, question_type: Optional[str] = None) -> List[Dict[str, Any]]:
         if not isinstance(slots, list) or not slots:
-            return self._fallback_slots(question, question_type)
+            return repair_answer_slot_topology(
+                self._fallback_slots(question, question_type), question, question_type
+            )
 
         normalized = []
         seen = set()
@@ -925,9 +1091,14 @@ class ReviewerPipeline(BasicPipeline):
                 "status": status,
                 "supporting_claim_ids": list(slot.get("supporting_claim_ids") or []),
                 "conflicting_claim_ids": list(slot.get("conflicting_claim_ids") or []),
+                "target_relation": slot.get("target_relation"),
+                "relation_family": slot.get("relation_family"),
+                "expected_answer_type": slot.get("expected_answer_type"),
+                "comparison_option": slot.get("comparison_option"),
             })
 
-        return normalized or self._fallback_slots(question, question_type)
+        normalized = normalized or self._fallback_slots(question, question_type)
+        return repair_answer_slot_topology(normalized, question, question_type)
 
     def _default_slot_role(self, question_type: Optional[str], idx: int, slot_count: int) -> str:
         if question_type == "bridge":
@@ -942,17 +1113,34 @@ class ReviewerPipeline(BasicPipeline):
 
     def _normalize_question_analysis(self, parsed: Dict[str, Any], question: str) -> Dict[str, Any]:
         valid_types = {"single_hop", "bridge", "comparison", "ambiguous"}
-        question_type = parsed.get("question_type")
-        if question_type not in valid_types:
-            question_type = self._infer_question_type(question)
+        original_question_type = parsed.get("question_type")
+        if original_question_type not in valid_types:
+            original_question_type = self._infer_question_type(question)
 
+        slots = self._normalize_slots(parsed.get("answer_slots"), question, original_question_type)
+        question_type, repair_reason = infer_effective_question_type(
+            original_question_type, slots, question
+        )
+        slots = repair_answer_slot_topology(slots, question, question_type)
+        answer_intent = build_answer_intent(
+            question,
+            question_type,
+            self._infer_answer_type(question),
+            slots,
+            parsed.get("answer_intent"),
+        )
+        slots = annotate_slots_with_intent(slots, answer_intent)
         state = {
             "question_type": question_type,
-            "answer_slots": self._normalize_slots(parsed.get("answer_slots"), question, question_type),
+            "original_question_type": original_question_type,
+            "question_type_repaired": question_type != original_question_type,
+            "question_type_repair_reason": repair_reason,
+            "answer_slots": slots,
             "claims": [],
             "retrieval_plan": [],
             "decision": "continue_retrieval",
-            "answer_type": self._infer_answer_type(question),
+            "answer_type": answer_intent.get("expected_answer_type") or self._infer_answer_type(question),
+            "answer_intent": answer_intent,
             "direct_answer_supported": False,
             "answer_candidate": None,
             "answer_candidate_claim_ids": [],
@@ -979,6 +1167,13 @@ class ReviewerPipeline(BasicPipeline):
             support_status = claim.get("support_status") or claim.get("relation_to_question") or "support"
             if support_status not in {"support", "contradict", "irrelevant"}:
                 support_status = "support"
+            semantic_values = {}
+            for key in ("subject", "predicate", "object", "object_type"):
+                value = claim.get(key)
+                if value is None or str(value).strip().lower() in {"", "null", "none", "unknown", "n/a"}:
+                    semantic_values[key] = None
+                else:
+                    semantic_values[key] = str(value).strip()
             normalized.append({
                 "claim_id": str(claim.get("claim_id") or f"c{idx + 1}"),
                 "doc_id": str(claim.get("doc_id") or ""),
@@ -986,6 +1181,7 @@ class ReviewerPipeline(BasicPipeline):
                 "text": text,
                 "support_status": support_status,
                 "round_id": claim.get("round_id", round_id),
+                **semantic_values,
             })
         return normalized
 
@@ -1108,6 +1304,14 @@ class ReviewerPipeline(BasicPipeline):
                 parsed.get("slot_updates"),
                 previous_state.get("answer_slots", []),
             )
+        answer_intent = build_answer_intent(
+            question,
+            previous_state.get("question_type", self._infer_question_type(question)),
+            previous_state.get("answer_type", self._infer_answer_type(question)),
+            slots,
+            previous_state.get("answer_intent"),
+        )
+        slots = annotate_slots_with_intent(slots, answer_intent)
         valid_slot_ids = {slot["slot_id"] for slot in slots}
 
         old_claims = previous_state.get("claims", [])
@@ -1145,7 +1349,7 @@ class ReviewerPipeline(BasicPipeline):
         answer_candidate = str(parsed.get("answer_candidate") or "").strip() or None
         answer_candidate_claim_ids = list(parsed.get("answer_candidate_claim_ids") or [])
         valid_answer_types = {"yes_no", "person", "date", "location", "title_or_entity", "number", "phrase"}
-        answer_type = parsed.get("answer_type") or previous_state.get("answer_type") or self._infer_answer_type(question)
+        answer_type = answer_intent.get("expected_answer_type") or previous_state.get("answer_type") or self._infer_answer_type(question)
         if answer_type not in valid_answer_types:
             answer_type = self._infer_answer_type(question)
         final_answer_slot_ids = self._final_answer_slot_ids(slots)
@@ -1173,7 +1377,9 @@ class ReviewerPipeline(BasicPipeline):
             if not unresolved:
                 decision = "ready_to_answer" if direct_answer_supported else "force_answer"
             else:
-                decision = "force_answer"
+                if previous_state.get("question_type") == "bridge":
+                    retrieval_plan = self._build_bridge_fallback_plan(question, slots, merged_claims)
+                decision = "continue_retrieval" if retrieval_plan else "force_answer"
 
         state = {
             "question_type": previous_state.get("question_type", self._infer_question_type(question)),
@@ -1182,6 +1388,9 @@ class ReviewerPipeline(BasicPipeline):
             "retrieval_plan": retrieval_plan,
             "decision": decision,
             "answer_type": answer_type,
+            "answer_intent": answer_intent,
+            "relation_grounding_trace": previous_state.get("relation_grounding_trace", {}),
+            "answer_decision": previous_state.get("answer_decision", {}),
             "direct_answer_supported": direct_answer_supported,
             "answer_candidate": answer_candidate,
             "answer_candidate_claim_ids": answer_candidate_claim_ids,
@@ -1246,6 +1455,284 @@ class ReviewerPipeline(BasicPipeline):
 
     def _slot_coverage(self, state: Dict[str, Any]) -> Dict[str, Any]:
         return ReviewState.from_dict(state).slot_coverage()
+
+    def _build_chain_grounding_trace(
+        self,
+        state: Dict[str, Any],
+        docs: Optional[List[Dict]] = None,
+        question: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        slots = state.get("answer_slots") or []
+        claims = state.get("claims") or []
+        final_slot_ids = self._final_answer_slot_ids(slots)
+        if not final_slot_ids and state.get("question_type") == "comparison":
+            final_slot_ids = {
+                slot.get("slot_id")
+                for slot in slots
+                if slot.get("status") == "supported"
+            }
+        intermediate_slot_ids = {
+            slot.get("slot_id")
+            for slot in slots
+            if slot.get("slot_id") not in final_slot_ids
+            and slot.get("slot_role") not in {"final_answer", "direct_answer"}
+        }
+        title_by_doc_id = {}
+        for idx, doc in enumerate(docs or []):
+            doc_id = self._safe_doc_id(doc, idx)
+            title = self._doc_title(doc)
+            title_by_doc_id[str(doc_id)] = title
+            if doc.get("id") is not None:
+                title_by_doc_id[str(doc.get("id"))] = title
+
+        resolved_entities = []
+        seen_entities = set()
+        for claim in claims:
+            if claim.get("slot_id") not in intermediate_slot_ids:
+                continue
+            if claim.get("support_status") != "support":
+                continue
+            for entity in self._extract_entities_from_claim(claim.get("text", "")):
+                key = self._normalize_entity(entity)
+                if not key or key in seen_entities:
+                    continue
+                seen_entities.add(key)
+                resolved_entities.append({
+                    "entity": entity,
+                    "normalized": key,
+                    "slot_id": claim.get("slot_id"),
+                    "claim_id": claim.get("claim_id"),
+                })
+
+        final_support_claims = [
+            claim for claim in claims
+            if claim.get("slot_id") in final_slot_ids
+            and claim.get("support_status") == "support"
+        ]
+        grounded_ids = []
+        ungrounded_ids = []
+        claim_grounding = {}
+        has_intermediate_slots = bool(intermediate_slot_ids)
+        for claim in final_support_claims:
+            claim_id = claim.get("claim_id")
+            if not has_intermediate_slots:
+                grounded = True
+                matched_entities = []
+                reason = "direct_answer"
+            elif not resolved_entities:
+                grounded = False
+                matched_entities = []
+                reason = "no_resolved_intermediate_entity"
+            else:
+                claim_text = str(claim.get("text") or "")
+                doc_title = title_by_doc_id.get(str(claim.get("doc_id") or ""), "")
+                haystack = f"{claim_text} {doc_title}"
+                matched_entities = [
+                    entity["entity"]
+                    for entity in resolved_entities
+                    if self._entity_mentioned(entity["entity"], haystack)
+                ]
+                grounded = bool(matched_entities)
+                reason = "matched_intermediate_entity" if grounded else "final_claim_not_bound_to_intermediate_entity"
+            claim_grounding[str(claim_id)] = {
+                "grounded": grounded,
+                "matched_entities": matched_entities,
+                "reason": reason,
+            }
+            if grounded:
+                if claim_id is not None:
+                    grounded_ids.append(claim_id)
+            else:
+                if claim_id is not None:
+                    ungrounded_ids.append(claim_id)
+
+        intermediate_supported = (
+            not has_intermediate_slots
+            or bool(resolved_entities)
+        )
+        final_supported = bool(final_support_claims)
+        final_grounded = bool(grounded_ids) if final_supported else False
+        if not has_intermediate_slots:
+            chain_coverage = 1.0 if final_supported else 0.0
+        else:
+            chain_coverage = (
+                int(intermediate_supported)
+                + int(final_supported)
+                + int(final_grounded)
+            ) / 3.0
+        if not final_supported:
+            ungrounded_reason = "no_final_support_claim"
+        elif not intermediate_supported:
+            ungrounded_reason = "no_resolved_intermediate_entity"
+        elif not final_grounded:
+            ungrounded_reason = "final_claim_not_bound_to_intermediate_entity"
+        else:
+            ungrounded_reason = None
+        return {
+            "chain_grounded": bool(final_grounded),
+            "chain_coverage": chain_coverage,
+            "resolved_intermediate_entities": resolved_entities,
+            "grounded_final_claim_ids": grounded_ids,
+            "ungrounded_final_claim_ids": ungrounded_ids,
+            "claim_grounding": claim_grounding,
+            "ungrounded_reason": ungrounded_reason,
+            "requires_grounding": has_intermediate_slots,
+        }
+
+    def _build_relation_grounding_trace(
+        self,
+        state: Dict[str, Any],
+        docs: Optional[List[Dict]] = None,
+        question: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        trace = evaluate_answer_semantics(
+            str(question or ""),
+            state,
+            docs=docs,
+            candidate_extractor=self._claim_to_answer_candidate,
+            answer_type_matcher=self._candidate_matches_answer_type,
+            enable_comparison_executor=self.enable_comparison_executor,
+            deterministic_commit_scope=(
+                self.deterministic_commit_scope
+                if self.enable_deterministic_answer_commit
+                and self.relation_grounding_mode == "control"
+                else "none"
+            ),
+        )
+        decision = dict(trace.get("answer_decision") or {})
+        if (
+            decision.get("commit_mode") == "deterministic_commit"
+            and not self.enable_deterministic_answer_commit
+        ):
+            decision["commit_mode"] = "guided_generation"
+            decision["commit_reason"] = "deterministic_commit_disabled"
+            trace["answer_decision"] = decision
+        return trace
+
+    def _normalize_entity(self, entity: Any) -> str:
+        text = str(entity or "").lower()
+        text = re.sub(r"\b(the|a|an)\b", " ", text)
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        return " ".join(text.split())
+
+    def _entity_mentioned(self, entity: Any, text: Any) -> bool:
+        normalized_entity = self._normalize_entity(entity)
+        normalized_text = self._normalize_entity(text)
+        if not normalized_entity or not normalized_text:
+            return False
+        if normalized_entity in normalized_text:
+            return True
+        entity_tokens = set(normalized_entity.split())
+        text_tokens = set(normalized_text.split())
+        return len(entity_tokens) >= 2 and entity_tokens.issubset(text_tokens)
+
+    def _extract_entities_from_claim(self, claim_text: str) -> List[str]:
+        text = str(claim_text or "").strip()
+        entities = []
+        short_candidate = self._claim_to_short_answer_candidate(text)
+        if short_candidate:
+            entities.append(short_candidate)
+        for match in re.finditer(
+            r"\b(?:by|from|of|for|with|to|at|in)\s+"
+            r"([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,5})",
+            text,
+        ):
+            entities.append(match.group(1).strip(" ,."))
+        subject = re.match(
+            r"^([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,5})\s+",
+            text,
+        )
+        if subject:
+            entities.append(subject.group(1).strip(" ,."))
+        deduped = []
+        seen = set()
+        for entity in entities:
+            key = self._normalize_entity(entity)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(entity)
+        return deduped[:6]
+
+    def _apply_chain_grounding_ready_guard(
+        self,
+        state: Dict[str, Any],
+        docs: List[Dict],
+        question: str,
+    ) -> bool:
+        if not self.enable_relation_grounding:
+            chain_trace = self._build_chain_grounding_trace(state, docs, question)
+            state["chain_grounding_trace"] = chain_trace
+            if (
+                state.get("decision") != "ready_to_answer"
+                or not chain_trace.get("requires_grounding")
+                or chain_trace.get("chain_grounded")
+            ):
+                return False
+
+            state["ready_guard_triggered"] = True
+            fallback_plan = self._build_bridge_fallback_plan(
+                question,
+                state.get("answer_slots", []),
+                state.get("claims", []),
+            )
+            if fallback_plan and not state.get("guard_extra_round_used"):
+                state["retrieval_plan"] = fallback_plan
+                state["guard_extra_round_pending"] = True
+                state["failure_reason"] = None
+                state["decision"] = "continue_retrieval"
+            else:
+                state["retrieval_plan"] = []
+                state["failure_reason"] = state.get("failure_reason") or "chain_ungrounded_final_slot"
+                state["decision"] = "force_answer"
+            return True
+
+        relation_trace = self._build_relation_grounding_trace(state, docs, question)
+        relation_trace["control_action"] = (
+            "diagnostic_only" if self.relation_grounding_mode == "diagnostic" else "control"
+        )
+        chain_trace = relation_trace.get("chain_grounding_trace") or {}
+        answer_decision = relation_trace.get("answer_decision") or {}
+        state["answer_intent"] = relation_trace.get("answer_intent") or state.get("answer_intent", {})
+        state["relation_grounding_trace"] = relation_trace
+        state["chain_grounding_trace"] = chain_trace
+        state["answer_decision"] = answer_decision
+
+        if self.relation_grounding_mode == "diagnostic":
+            return False
+
+        if answer_decision.get("commit_mode") == "deterministic_commit":
+            changed = state.get("decision") != "ready_to_answer"
+            state["decision"] = "ready_to_answer"
+            state["direct_answer_supported"] = True
+            state["retrieval_plan"] = []
+            state["failure_reason"] = None
+            state["guard_extra_round_pending"] = False
+            return changed
+
+        if (
+            state.get("decision") != "ready_to_answer"
+            or relation_trace.get("relation_grounded")
+        ):
+            return False
+
+        state["ready_guard_triggered"] = True
+        fallback_plan = self._build_bridge_fallback_plan(
+            question,
+            state.get("answer_slots", []),
+            state.get("claims", []),
+        )
+        if fallback_plan and not state.get("guard_extra_round_used"):
+            state["retrieval_plan"] = fallback_plan
+            state["guard_extra_round_pending"] = True
+            state["failure_reason"] = None
+            state["decision"] = "continue_retrieval"
+        else:
+            state["guard_extra_round_pending"] = False
+            relation_trace["control_action"] = "guided_generation"
+            return False
+        relation_trace["control_action"] = "focused_retrieval"
+        return True
 
     def _count_new_claims(self, before: Dict[str, Any], after: Dict[str, Any]) -> int:
         before_signatures = {
@@ -1362,9 +1849,55 @@ class ReviewerPipeline(BasicPipeline):
         failure_reason: Optional[str] = None,
         question: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if self.enable_relation_grounding:
+            relation_trace = self._build_relation_grounding_trace(state, docs, question)
+            relation_trace["control_action"] = (
+                "diagnostic_only" if self.relation_grounding_mode == "diagnostic" else "control"
+            )
+            chain_trace = relation_trace.get("chain_grounding_trace") or {}
+            answer_decision = relation_trace.get("answer_decision") or {}
+            state["answer_intent"] = relation_trace.get("answer_intent") or state.get("answer_intent", {})
+            state["relation_grounding_trace"] = relation_trace
+            state["answer_decision"] = answer_decision
+        else:
+            relation_trace = {}
+            answer_decision = state.get("answer_decision") or {}
+            chain_trace = self._build_chain_grounding_trace(state, docs, question)
+        state["chain_grounding_trace"] = chain_trace
+        semantic_guidance_applied = bool(
+            self.enable_relation_grounding and self.relation_grounding_mode == "control"
+        )
+        grounded_final_claim_ids = {
+            str(claim_id)
+            for claim_id in chain_trace.get("grounded_final_claim_ids") or []
+        }
+        claim_grounding = chain_trace.get("claim_grounding") or {}
+        semantic_bindings = {
+            str(binding.get("claim_id")): binding
+            for binding in relation_trace.get("claim_bindings") or []
+            if binding.get("claim_id") and binding.get("source") != "reviewer_answer_candidate"
+        }
+        resolved_intermediate_entities = [
+            entity.get("entity")
+            for entity in chain_trace.get("resolved_intermediate_entities") or []
+            if entity.get("entity")
+        ]
         trusted_claims = [
             claim for claim in state.get("claims", [])
             if claim.get("support_status") == "support"
+        ]
+        validated_claim_ids = {
+            claim_id
+            for claim_id, binding in semantic_bindings.items()
+            if binding.get("eligible")
+        }
+        validated_claims = [
+            claim for claim in trusted_claims
+            if str(claim.get("claim_id")) in validated_claim_ids
+        ]
+        unvalidated_claims = [
+            claim for claim in trusted_claims
+            if str(claim.get("claim_id")) not in validated_claim_ids
         ]
         conflicted_claims = [
             claim for claim in state.get("claims", [])
@@ -1378,43 +1911,156 @@ class ReviewerPipeline(BasicPipeline):
             slot["slot_id"] for slot in state.get("answer_slots", [])
             if slot.get("status") == "supported"
         ]
-        answer_candidates = []
-        candidate_records = []
-        answer_candidate = str(state.get("answer_candidate") or "").strip()
-        if answer_candidate:
-            answer_candidates.append(answer_candidate)
-            candidate_records.append({
-                "candidate": answer_candidate,
-                "source": "answer_candidate",
-                "slot_id": None,
-                "claim_id": None,
-                "claim_text": "",
-                "slot_role": "final_answer",
-            })
         final_answer_slot_ids = self._final_answer_slot_ids(state.get("answer_slots", []))
-        if not final_answer_slot_ids and state.get("question_type") == "comparison":
+        if not self.enable_relation_grounding and not final_answer_slot_ids and state.get("question_type") == "comparison":
             final_answer_slot_ids = {
                 slot.get("slot_id")
                 for slot in state.get("answer_slots", [])
                 if slot.get("status") == "supported"
             }
         slots_by_id = {slot.get("slot_id"): slot for slot in state.get("answer_slots", [])}
+        claims_by_id = {
+            str(claim.get("claim_id")): claim
+            for claim in state.get("claims", [])
+            if claim.get("claim_id") is not None
+        }
+        answer_candidates = []
+        candidate_records = []
+        answer_candidate = str(state.get("answer_candidate") or "").strip()
+        if answer_candidate:
+            answer_candidate_claim_ids = [
+                str(claim_id)
+                for claim_id in state.get("answer_candidate_claim_ids") or []
+                if claim_id is not None
+            ]
+            candidate_claims = [
+                claims_by_id.get(claim_id)
+                for claim_id in answer_candidate_claim_ids
+                if claims_by_id.get(claim_id)
+            ]
+            candidate_is_final = any(
+                claim.get("slot_id") in final_answer_slot_ids
+                for claim in candidate_claims
+            )
+            candidate_is_intermediate = bool(candidate_claims) and not candidate_is_final
+            candidate_slot_id = candidate_claims[0].get("slot_id") if candidate_claims else None
+            candidate_slot = slots_by_id.get(candidate_slot_id) or {}
+            candidate_binding_valid = semantic_guidance_applied and any(binding.get("eligible") for binding in (
+                semantic_bindings.get(claim_id) or {} for claim_id in answer_candidate_claim_ids
+            ))
+            if candidate_binding_valid:
+                answer_candidates.append(answer_candidate)
+            candidate_records.append({
+                "candidate": answer_candidate,
+                "source": "reviewer_answer_candidate",
+                "slot_id": candidate_slot_id,
+                "claim_id": answer_candidate_claim_ids[0] if answer_candidate_claim_ids else None,
+                "claim_text": " ".join(
+                    str(claim.get("text") or "")
+                    for claim in candidate_claims[:3]
+                    if claim
+                ),
+                "slot_role": (
+                    "final_answer"
+                    if candidate_is_final
+                    else "intermediate_entity" if candidate_is_intermediate else candidate_slot.get("slot_role", "unknown")
+                ),
+                "answer_candidate_claim_ids": answer_candidate_claim_ids,
+                "has_claim_provenance": bool(answer_candidate_claim_ids),
+                "chain_grounded": bool(grounded_final_claim_ids.intersection(answer_candidate_claim_ids)),
+                "matches_resolved_intermediate": any(
+                    self._normalize_entity(answer_candidate) == self._normalize_entity(entity)
+                    for entity in resolved_intermediate_entities
+                ),
+                "grounding_reason": "matched_grounded_final_claim" if grounded_final_claim_ids.intersection(answer_candidate_claim_ids) else chain_trace.get("ungrounded_reason"),
+            })
         for claim in trusted_claims:
             if claim.get("slot_id") not in final_answer_slot_ids:
                 continue
-            candidate = self._claim_to_short_answer_candidate(claim.get("text", ""))
-            if candidate and candidate not in answer_candidates:
+            binding = semantic_bindings.get(str(claim.get("claim_id"))) or {}
+            candidate = str(binding.get("candidate") or claim.get("object") or "").strip()
+            if not candidate:
+                candidate = self._claim_to_answer_candidate(
+                    claim.get("text", ""),
+                    state.get("answer_type"),
+                    question,
+                )
+            if (
+                semantic_guidance_applied
+                and candidate
+                and binding.get("eligible")
+                and candidate not in answer_candidates
+            ):
                 answer_candidates.append(candidate)
             if candidate:
                 slot = slots_by_id.get(claim.get("slot_id")) or {}
+                claim_id = str(claim.get("claim_id"))
+                grounding = claim_grounding.get(claim_id) or {}
                 candidate_records.append({
                     "candidate": candidate,
-                    "source": "trusted_claim",
+                    "source": "validated_claim" if binding.get("eligible") else "unvalidated_claim",
                     "slot_id": claim.get("slot_id"),
                     "claim_id": claim.get("claim_id"),
                     "claim_text": claim.get("text", ""),
                     "slot_role": slot.get("slot_role"),
+                    "has_claim_provenance": bool(claim.get("claim_id")),
+                    "chain_grounded": claim_id in grounded_final_claim_ids,
+                    "matches_resolved_intermediate": any(
+                        self._normalize_entity(candidate) == self._normalize_entity(entity)
+                        for entity in resolved_intermediate_entities
+                    ),
+                    "grounding_reason": grounding.get("reason") or chain_trace.get("ungrounded_reason"),
+                    "target_relation_match": bool(binding.get("target_relation_match")),
+                    "candidate_role_valid": bool(binding.get("candidate_role_valid")),
+                    "candidate_answer_type_match": bool(binding.get("candidate_answer_type_match")),
+                    "eligible_for_commit": bool(binding.get("eligible")),
+                    "candidate_is_question_entity": bool(binding.get("candidate_is_question_entity")),
+                    "candidate_is_intermediate_entity": bool(binding.get("candidate_is_intermediate_entity")),
+                    "binding_direction": binding.get("binding_direction"),
+                    "anchor_entity": binding.get("anchor_entity"),
+                    "anchor_endpoint": binding.get("anchor_endpoint"),
+                    "candidate_endpoint": binding.get("candidate_endpoint"),
+                    "entity_binding_valid": bool(binding.get("entity_binding_valid")),
+                    "provenance_valid": bool(binding.get("provenance_valid")),
                 })
+        committed_candidate = str(answer_decision.get("selected_answer_candidate") or "").strip()
+        if semantic_guidance_applied and committed_candidate and committed_candidate not in answer_candidates:
+            answer_candidates.insert(0, committed_candidate)
+            candidate_records.insert(0, {
+                "candidate": committed_candidate,
+                "source": answer_decision.get("candidate_source") or "comparison_executor",
+                "slot_id": None,
+                "claim_id": (answer_decision.get("committed_claim_ids") or [None])[0],
+                "claim_text": "",
+                "slot_role": "final_answer",
+                "has_claim_provenance": bool(answer_decision.get("committed_claim_ids")),
+                "chain_grounded": True,
+                "matches_resolved_intermediate": False,
+                "grounding_reason": answer_decision.get("commit_reason"),
+                "target_relation_match": True,
+                "candidate_role_valid": True,
+                "candidate_answer_type_match": True,
+                "eligible_for_commit": True,
+            })
+        counterfactual_candidate = str(relation_trace.get("counterfactual_answer_candidate") or "").strip()
+        if counterfactual_candidate and not committed_candidate:
+            candidate_records.append({
+                "candidate": counterfactual_candidate,
+                "source": relation_trace.get("counterfactual_candidate_source") or "comparison_executor",
+                "slot_id": None,
+                "claim_id": (relation_trace.get("counterfactual_claim_ids") or [None])[0],
+                "claim_text": "",
+                "slot_role": "final_answer",
+                "has_claim_provenance": bool(relation_trace.get("counterfactual_claim_ids")),
+                "chain_grounded": bool(relation_trace.get("relation_grounded")),
+                "matches_resolved_intermediate": False,
+                "grounding_reason": "counterfactual_only",
+                "target_relation_match": bool(relation_trace.get("target_relation_match")),
+                "candidate_role_valid": True,
+                "candidate_answer_type_match": True,
+                "eligible_for_commit": False,
+                "counterfactual_only": True,
+            })
         policy_trace = self._score_answer_candidates(
             candidate_records,
             answer_candidates,
@@ -1422,7 +2068,7 @@ class ReviewerPipeline(BasicPipeline):
             state.get("question_type"),
             question,
         )
-        selected_answer_candidate = self._select_answer_candidate(
+        selected_answer_candidate = committed_candidate or self._select_answer_candidate(
             answer_candidates,
             state.get("answer_type"),
             state.get("question_type"),
@@ -1433,9 +2079,9 @@ class ReviewerPipeline(BasicPipeline):
         candidate_source = None
         if selected_answer_candidate:
             candidate_source = (
-                "answer_candidate"
+                "reviewer_answer_candidate"
                 if selected_answer_candidate in {answer_candidate, compressed_answer_candidate}
-                else "trusted_claim"
+                else "unvalidated_claim"
             )
             for record in policy_trace.get("ranked_candidates") or []:
                 if record.get("candidate") == selected_answer_candidate:
@@ -1443,10 +2089,28 @@ class ReviewerPipeline(BasicPipeline):
                     break
         return {
             "trusted_claims": trusted_claims,
+            "validated_claims": validated_claims,
+            "unvalidated_claims": unvalidated_claims,
             "answer_candidates": answer_candidates[:8],
             "selected_answer_candidate": selected_answer_candidate,
             "candidate_source": candidate_source,
             "answer_policy_trace": policy_trace,
+            "answer_intent": state.get("answer_intent", {}),
+            "relation_grounding_trace": relation_trace,
+            "answer_decision": answer_decision,
+            "semantic_guidance_applied": semantic_guidance_applied,
+            "diagnostic_candidate_leakage": bool(
+                not semantic_guidance_applied and answer_candidates
+            ),
+            "counterfactual_answer_candidate": relation_trace.get("counterfactual_answer_candidate"),
+            "counterfactual_candidate_source": relation_trace.get("counterfactual_candidate_source"),
+            "would_commit_under_v2_7": bool(relation_trace.get("would_commit_under_v2_7")),
+            "generated_without_validated_candidate": bool(
+                answer_decision.get("commit_mode") in {"guided_generation", "forced_generation"}
+                and not validated_claims
+            ),
+            "chain_grounding_trace": chain_trace,
+            "chain_coverage": chain_trace.get("chain_coverage"),
             "answer_type": state.get("answer_type"),
             "ignored_docs": state.get("ignored_docs", []),
             "conflict_resolution": [
@@ -1471,20 +2135,40 @@ class ReviewerPipeline(BasicPipeline):
     def _render_adoption_policy(self, policy: Dict[str, Any]) -> str:
         """Render internal policy as natural-language guidance for the generator."""
         trusted_claims = policy.get("trusted_claims") or []
+        validated_claims = policy.get("validated_claims") or []
         answer_candidates = policy.get("answer_candidates") or []
         insufficient_slots = policy.get("insufficient_slots") or []
         ignored_docs = policy.get("ignored_docs") or []
         conflict_resolution = policy.get("conflict_resolution") or []
+        chain_trace = policy.get("chain_grounding_trace") or {}
+        grounded_claim_ids = {
+            str(claim_id)
+            for claim_id in chain_trace.get("grounded_final_claim_ids") or []
+        }
 
-        lines = ["Supported facts to use:"]
-        if trusted_claims:
-            for claim in trusted_claims[:12]:
-                text = str(claim.get("text") or "").strip()
-                doc_id = claim.get("doc_id")
-                if text:
-                    lines.append(f"- {text}" + (f" (source document id: {doc_id})" if doc_id else ""))
-        else:
-            lines.append("- No explicit supported claim was extracted; rely on the most relevant document text.")
+        lines = []
+        if policy.get("semantic_guidance_applied"):
+            lines.append("Relation-validated answer facts:")
+            if validated_claims:
+                for claim in validated_claims[:12]:
+                    text = str(claim.get("text") or "").strip()
+                    doc_id = claim.get("doc_id")
+                    if text:
+                        lines.append(f"- {text}" + (f" (source document id: {doc_id})" if doc_id else ""))
+            else:
+                lines.append("- No final-answer claim passed relation validation; infer cautiously from the most relevant document text.")
+
+            if grounded_claim_ids:
+                lines.append("Grounded final-answer facts:")
+                for claim in validated_claims[:12]:
+                    if str(claim.get("claim_id")) not in grounded_claim_ids:
+                        continue
+                    text = str(claim.get("text") or "").strip()
+                    if text:
+                        lines.append(f"- {text}")
+            elif chain_trace and chain_trace.get("requires_grounding"):
+                lines.append("Grounding constraint:")
+                lines.append("- Prefer final-answer facts bound to resolved intermediate entities; avoid outputting an intermediate entity as the answer.")
 
         if answer_candidates:
             lines.append("Preferred short answer candidates:")
@@ -1539,6 +2223,8 @@ class ReviewerPipeline(BasicPipeline):
             if selected:
                 return selected
             return answer_candidates[0]
+        if not policy.get("semantic_guidance_applied"):
+            return None
         candidates = []
         for claim in policy.get("trusted_claims") or []:
             text = str(claim.get("text") or "").strip()
@@ -1633,13 +2319,38 @@ class ReviewerPipeline(BasicPipeline):
             if record.get("slot_role") in {"final_answer", "direct_answer"}:
                 score += 20
                 reasons.append("final_slot")
-            if record.get("source") == "answer_candidate":
-                score += 8
-                reasons.append("reviewer_answer_candidate")
+            if record.get("source") == "reviewer_answer_candidate":
+                if record.get("has_claim_provenance"):
+                    score += 8
+                    reasons.append("reviewer_answer_candidate_with_provenance")
+                else:
+                    score -= 20
+                    reasons.append("missing_candidate_claim_provenance")
+            if record.get("source") == "validated_claim":
+                score += 24
+                reasons.append("relation_validated_claim")
+            elif record.get("source") == "unvalidated_claim":
+                score -= 32
+                reasons.append("unvalidated_claim_penalty")
+            if record.get("chain_grounded"):
+                score += 30
+                reasons.append("chain_grounded")
+            elif question_type in {"bridge", "multihop"} or record.get("slot_role") == "intermediate_entity":
+                score -= 28
+                reasons.append("ungrounded_or_intermediate_candidate")
+            if question_type in {"bridge", "multihop"} and record.get("matches_resolved_intermediate"):
+                score -= 45
+                reasons.append("resolved_intermediate_entity_penalty")
             overlap = self._question_candidate_overlap(candidate, q)
-            if overlap:
+            if overlap and question_type == "comparison":
                 score += min(overlap * 3, 18)
-                reasons.append("question_keyword_overlap")
+                reasons.append("comparison_option_overlap")
+            elif record.get("candidate_is_question_entity"):
+                score -= 40
+                reasons.append("question_entity_penalty")
+            if record.get("candidate_is_intermediate_entity"):
+                score -= 45
+                reasons.append("intermediate_entity_penalty")
             if answer_type in {"number", "date"} and re.search(r"\([^)]*\d[^)]*\)", str(record.get("claim_text") or "")):
                 score += 12
                 reasons.append("parenthetical_specificity")
@@ -1664,6 +2375,14 @@ class ReviewerPipeline(BasicPipeline):
                 "source": record.get("source"),
                 "slot_id": record.get("slot_id"),
                 "claim_id": record.get("claim_id"),
+                "chain_grounded": bool(record.get("chain_grounded")),
+                "has_claim_provenance": bool(record.get("has_claim_provenance")),
+                "matches_resolved_intermediate": bool(record.get("matches_resolved_intermediate")),
+                "grounding_reason": record.get("grounding_reason"),
+                "target_relation_match": bool(record.get("target_relation_match")),
+                "candidate_role_valid": bool(record.get("candidate_role_valid")),
+                "candidate_answer_type_match": bool(record.get("candidate_answer_type_match")),
+                "eligible_for_commit": bool(record.get("eligible_for_commit")),
                 "reasons": reasons,
             })
         ranked.sort(key=lambda item: (-item["score"], len(str(item["candidate"]).split()), len(str(item["candidate"]))))
@@ -1703,6 +2422,39 @@ class ReviewerPipeline(BasicPipeline):
         if answer_type in {"person", "location", "title_or_entity"}:
             return bool(re.search(r"\b[A-Z][A-Za-z0-9$'.-]+", text)) and len(text.split()) <= 8
         return len(text.split()) <= 12
+
+    def _claim_to_answer_candidate(
+        self,
+        claim_text: str,
+        answer_type: Optional[str] = None,
+        question: Optional[str] = None,
+    ) -> Optional[str]:
+        text = str(claim_text or "").strip()
+        if not text:
+            return None
+        answer_type = str(answer_type or "").lower()
+        question_lower = str(question or "").lower()
+
+        if answer_type == "location" or question_lower.startswith("where"):
+            location_patterns = [
+                r"\b(?:born|died|located|based|headquartered|situated)\s+(?:in|at|near)\s+([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,5})",
+                r"\b(?:city|country|state|province|region|location)\s+(?:is|was)\s+([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,5})",
+                r"\b(?:in|at|from)\s+([A-Z][A-Za-z0-9$'.-]+(?:\s+[A-Z][A-Za-z0-9$'.-]+){0,5})(?:[.,]|$)",
+            ]
+            for pattern in location_patterns:
+                match = re.search(pattern, text)
+                if match:
+                    return match.group(1).strip(" ,.")
+
+        if answer_type == "date":
+            date_match = re.search(
+                r"\b(?:in|on|during)\s+([A-Z][a-z]+(?:\s+\d{1,2})?,?\s+\d{4}|\d{4})\b",
+                text,
+            )
+            if date_match:
+                return date_match.group(1).strip(" ,.")
+
+        return self._claim_to_short_answer_candidate(text)
 
     def _claim_to_short_answer_candidate(self, claim_text: str) -> Optional[str]:
         text = str(claim_text or "").strip()
@@ -1947,6 +2699,52 @@ class ReviewerPipeline(BasicPipeline):
         if len(answer.split()) > 80 and len(first_line.split()) <= 25:
             answer = first_line
         return answer.strip()
+
+    def _committed_answer_from_policy(self, policy: Optional[Dict[str, Any]]) -> Optional[str]:
+        if not self.enable_deterministic_answer_commit or not policy:
+            return None
+        decision = policy.get("answer_decision") or {}
+        if decision.get("commit_mode") != "deterministic_commit":
+            return None
+        candidate = str(decision.get("selected_answer_candidate") or "").strip()
+        return candidate or None
+
+    def _finalize_answer(
+        self,
+        generated_answer: Optional[str],
+        policy: Optional[Dict[str, Any]],
+        evidence_state: Optional[Dict[str, Any]],
+    ) -> str:
+        committed = self._committed_answer_from_policy(policy)
+        if committed:
+            return committed
+        return self._clean_final_answer(generated_answer or "", policy, evidence_state)
+
+    def _generate_final_answers(
+        self,
+        prompts: List[str],
+        policies: List[Optional[Dict[str, Any]]],
+        evidence_states: List[Dict[str, Any]],
+    ) -> List[str]:
+        answers: List[Optional[str]] = [None] * len(prompts)
+        generation_indices = []
+        generation_prompts = []
+        for idx, prompt in enumerate(prompts):
+            committed = self._committed_answer_from_policy(policies[idx])
+            if committed:
+                answers[idx] = committed
+            else:
+                generation_indices.append(idx)
+                generation_prompts.append(prompt)
+
+        generated = self._batched_generate(self.generator, generation_prompts) if generation_prompts else []
+        for offset, idx in enumerate(generation_indices):
+            answers[idx] = self._finalize_answer(
+                generated[offset],
+                policies[idx],
+                evidence_states[idx],
+            )
+        return [str(answer or "") for answer in answers]
 
     def parse_reviewer_response(self, response: str) -> Dict[str, Any]:
         """Backward-compatible parser that does not default parse failures to ready."""
@@ -2277,17 +3075,79 @@ class ReviewerPipeline(BasicPipeline):
         selected_candidate = str((policy or {}).get("selected_answer_candidate") or "").strip()
         normalized_pred = self._normalize_answer_for_policy_match(pred)
         normalized_selected = self._normalize_answer_for_policy_match(selected_candidate)
+        chain_trace = (
+            (policy or {}).get("chain_grounding_trace")
+            or state.get("chain_grounding_trace")
+            or {}
+        )
+        relation_trace = (
+            (policy or {}).get("relation_grounding_trace")
+            or state.get("relation_grounding_trace")
+            or {}
+        )
+        answer_decision = (
+            (policy or {}).get("answer_decision")
+            or state.get("answer_decision")
+            or {}
+        )
+        used_forced_policy = state.get("decision") == "force_answer" or bool(state.get("failure_reason"))
         return {
             "pred": pred,
             "golden_answers": golden_answers,
             "answer_length": len(str(pred).split()),
-            "used_forced_policy": state.get("decision") == "force_answer" or bool(state.get("failure_reason")),
+            "used_forced_policy": used_forced_policy,
             "failure_reason": state.get("failure_reason"),
             "answer_type": state.get("answer_type"),
             "direct_answer_supported": bool(state.get("direct_answer_supported")),
             "answer_candidate": state.get("answer_candidate"),
             "selected_answer_candidate": selected_candidate or None,
             "answer_policy_trace": (policy or {}).get("answer_policy_trace", {}),
+            "answer_intent": (policy or {}).get("answer_intent") or state.get("answer_intent", {}),
+            "relation_grounding_trace": relation_trace,
+            "answer_decision": answer_decision,
+            "relation_grounded": bool(relation_trace.get("relation_grounded")),
+            "semantic_coverage": relation_trace.get("semantic_coverage"),
+            "subject_grounded": bool(relation_trace.get("subject_grounded")),
+            "target_relation_match": bool(relation_trace.get("target_relation_match")),
+            "candidate_role_valid": bool(relation_trace.get("candidate_role_valid")),
+            "candidate_answer_type_match": bool(relation_trace.get("candidate_answer_type_match")),
+            "candidate_is_question_entity": bool(relation_trace.get("candidate_is_question_entity")),
+            "candidate_is_intermediate_entity": bool(relation_trace.get("candidate_is_intermediate_entity")),
+            "grounded_but_wrong_relation": bool(relation_trace.get("grounded_but_wrong_relation")),
+            "comparison_execution_status": relation_trace.get("comparison_execution_status"),
+            "intent_source": relation_trace.get("intent_source"),
+            "intent_conflict": bool(relation_trace.get("intent_conflict")),
+            "operand_binding_status": relation_trace.get("operand_binding_status"),
+            "comparison_lineage": relation_trace.get("comparison_lineage") or [],
+            "strict_comparison_executable": bool(relation_trace.get("strict_comparison_executable")),
+            "counterfactual_answer_candidate": relation_trace.get("counterfactual_answer_candidate"),
+            "counterfactual_candidate_source": relation_trace.get("counterfactual_candidate_source"),
+            "would_commit_under_v2_7": bool(relation_trace.get("would_commit_under_v2_7")),
+            "control_action": relation_trace.get("control_action", "diagnostic_only"),
+            "forced_by_relation_guard": bool(
+                state.get("failure_reason") == "relation_ungrounded_final_slot"
+            ),
+            "generated_without_validated_candidate": bool(
+                (policy or {}).get("generated_without_validated_candidate")
+            ),
+            "semantic_guidance_applied": bool((policy or {}).get("semantic_guidance_applied")),
+            "diagnostic_candidate_leakage": bool((policy or {}).get("diagnostic_candidate_leakage")),
+            "entity_binding_valid": bool(relation_trace.get("entity_binding_valid")),
+            "binding_directions": relation_trace.get("binding_directions") or [],
+            "original_question_type": state.get("original_question_type", state.get("question_type")),
+            "effective_question_type": state.get("question_type"),
+            "question_type_repaired": bool(state.get("question_type_repaired")),
+            "question_type_repair_reason": state.get("question_type_repair_reason"),
+            "commit_mode": answer_decision.get("commit_mode"),
+            "commit_reason": answer_decision.get("commit_reason"),
+            "committed_claim_ids": answer_decision.get("committed_claim_ids") or [],
+            "chain_grounding_trace": chain_trace,
+            "chain_coverage": chain_trace.get("chain_coverage"),
+            "ungrounded_forced_answer": bool(
+                used_forced_policy
+                and chain_trace
+                and not chain_trace.get("chain_grounded")
+            ),
             "answer_policy_mismatch": bool(
                 normalized_selected
                 and normalized_pred
@@ -2339,6 +3199,8 @@ class ReviewerPipeline(BasicPipeline):
             "selected_answer_candidate": parsed.get("selected_answer_candidate", fallback.get("selected_answer_candidate")),
             "candidate_source": parsed.get("candidate_source", fallback.get("candidate_source")),
             "answer_policy_trace": parsed.get("answer_policy_trace", fallback.get("answer_policy_trace")),
+            "chain_grounding_trace": parsed.get("chain_grounding_trace", fallback.get("chain_grounding_trace")),
+            "chain_coverage": parsed.get("chain_coverage", fallback.get("chain_coverage")),
             "answer_type": parsed.get("answer_type", fallback.get("answer_type")),
             "ignored_docs": parsed.get("ignored_docs", fallback["ignored_docs"]),
             "conflict_resolution": parsed.get("conflict_resolution", fallback["conflict_resolution"]),
@@ -2406,6 +3268,7 @@ class ReviewerPipeline(BasicPipeline):
             ):
                 evidence_state["decision"] = "ready_to_answer"
                 evidence_state["retrieval_plan"] = []
+            self._apply_chain_grounding_ready_guard(evidence_state, current_docs, question)
             self._mark_guard_extra_for_last_chance_retrieval(
                 evidence_state,
                 new_claim_count,
@@ -2537,6 +3400,7 @@ class ReviewerPipeline(BasicPipeline):
             })
 
         rendered_policy = self._render_adoption_policy(adoption_policy)
+        self._attach_policy_diagnostics(diagnostic_trace, adoption_policy)
         return current_docs, rendered_policy, review_history, evidence_state, adoption_policy, diagnostic_trace
 
     def run_item(self, item) -> None:
@@ -2558,6 +3422,7 @@ class ReviewerPipeline(BasicPipeline):
             diagnostic_trace.get("retrieval_trace", []),
         )
         verifier_trace = self._build_verifier_trace(evidence_state, adoption_policy)
+        self._attach_policy_diagnostics(diagnostic_trace, adoption_policy)
         diagnostic_trace["verifier_trace"] = verifier_trace
 
         # Store intermediate results
@@ -2583,9 +3448,12 @@ class ReviewerPipeline(BasicPipeline):
 
         item.update_output("prompt", final_prompt)
 
-        # Generate final answer
-        pred = self.generator.generate([final_prompt])[0]
-        pred = self._clean_final_answer(pred, adoption_policy, evidence_state)
+        # Deterministic decisions bypass the final generator.
+        pred = self._generate_final_answers(
+            [final_prompt],
+            [adoption_policy],
+            [evidence_state],
+        )[0]
         item.update_output("pred", pred)
         diagnostic_trace["final_trace"] = self._build_final_trace(
             pred,
@@ -2703,6 +3571,11 @@ class ReviewerPipeline(BasicPipeline):
                 ):
                     evidence_states[idx]["decision"] = "ready_to_answer"
                     evidence_states[idx]["retrieval_plan"] = []
+                self._apply_chain_grounding_ready_guard(
+                    evidence_states[idx],
+                    current_docs[idx],
+                    questions[idx],
+                )
                 self._mark_guard_extra_for_last_chance_retrieval(
                     evidence_states[idx],
                     new_claim_count,
@@ -2931,6 +3804,7 @@ class ReviewerPipeline(BasicPipeline):
                 )
             if adoption_strategies[idx] is None:
                 adoption_strategies[idx] = self._render_adoption_policy(adoption_policies[idx])
+            self._attach_policy_diagnostics(diagnostic_traces[idx], adoption_policies[idx])
 
         slot_coverages = [self._slot_coverage(state) for state in evidence_states]
         failure_reasons = [state.get("failure_reason") for state in evidence_states]
@@ -2973,11 +3847,11 @@ class ReviewerPipeline(BasicPipeline):
 
         dataset.update_output("prompt", all_prompts)
 
-        pred_answers = self._batched_generate(self.generator, all_prompts)
-        pred_answers = [
-            self._clean_final_answer(pred, adoption_policies[idx], evidence_states[idx])
-            for idx, pred in enumerate(pred_answers)
-        ]
+        pred_answers = self._generate_final_answers(
+            all_prompts,
+            adoption_policies,
+            evidence_states,
+        )
         dataset.update_output("pred", pred_answers)
         for idx, pred in enumerate(pred_answers):
             diagnostic_traces[idx]["final_trace"] = self._build_final_trace(
