@@ -6,6 +6,7 @@ answer decision that can be replayed against historical intermediate results.
 """
 
 import re
+import time
 import unicodedata
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -18,6 +19,24 @@ VALID_OPERATIONS = {
     "compare_max",
     "compare_equal",
     "unknown",
+}
+
+COMMIT_SAFE_COMPARISON_RELATIONS = {
+    "birth_date",
+    "creation_date",
+    "death_date",
+    "formation_date",
+    "ordinal_rank",
+    "release_date",
+}
+
+COMMIT_RELATION_VALUE_TYPES = {
+    "birth_date": {0},
+    "creation_date": {0},
+    "death_date": {0},
+    "formation_date": {0},
+    "ordinal_rank": {1},
+    "release_date": {0},
 }
 
 RELATION_ALIASES = {
@@ -41,8 +60,11 @@ RELATION_ALIASES = {
     "employment": ("worked for", "employed by", "employer", "software engineer"),
     "ownership": ("owner", "owners", "owned by", "ownership"),
     "succession": ("succeeded", "successor", "replaced", "merged with"),
+    "creation_date": ("created", "creation date"),
     "notable_work": ("notable work", "work did", "created", "wrote", "write for"),
     "role": ("played", "portrayed", "voiced", "voice of", "character"),
+    "ordinal_rank": ("singles ranking", "ranking", "rank"),
+    "formation_date": ("formed", "formation"),
     "material": ("made out of", "made of", "composed of", "constructed from", "material"),
     "award_title": ("voted", "awarded", "named", "honoured", "honored"),
     "destination": ("flow into", "flows into", "flow to", "mouth of", "drains into", "harbour"),
@@ -77,7 +99,7 @@ STOPWORDS = {
     "from", "is", "was", "were", "are", "did", "does", "do", "has", "have",
     "what", "which", "who", "where", "when", "how", "and", "or", "both",
     "same", "first", "earlier", "later", "older", "younger", "more", "less",
-    "newer", "newest", "oldest", "latest",
+    "newer", "newest", "oldest", "latest", "greater", "higher", "larger",
 }
 
 
@@ -87,6 +109,49 @@ def normalize_text(value: Any) -> str:
     text = re.sub(r"\b(the|a|an)\b", " ", text)
     text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE).replace("_", " ")
     return " ".join(text.split())
+
+
+def _provenance_title_match_status(title: Any, entity: Any) -> str:
+    raw_title = str(title or "").strip().strip('"\'')
+    raw_entity = str(entity or "").strip()
+    if not raw_title or not raw_entity:
+        return "unknown"
+    if normalize_text(raw_title) == normalize_text(raw_entity):
+        return "compatible"
+    title_without_disambiguator = re.sub(r"\s*\([^)]*\)\s*$", "", raw_title).strip()
+    if normalize_text(title_without_disambiguator) == normalize_text(raw_entity):
+        return "compatible"
+
+    title_tokens = set(normalize_text(raw_title).split())
+    entity_tokens = set(normalize_text(raw_entity).split())
+    if entity_tokens and entity_tokens < title_tokens:
+        return "incompatible"
+    return "unknown"
+
+
+def _numeric_literals(value: Any) -> set:
+    literals = set()
+    for match in re.findall(r"(?<![A-Za-z0-9])[-+]?\d[\d,]*(?:\.\d+)?", str(value or "")):
+        try:
+            literals.add(float(match.replace(",", "")))
+        except ValueError:
+            continue
+    return literals
+
+
+def _numeric_value_is_ambiguous(
+    claim: Optional[Dict[str, Any]],
+    raw_value: Any,
+    parsed_value: Any,
+    question: str,
+) -> bool:
+    if not claim or not isinstance(parsed_value, tuple) or parsed_value[0] != 1:
+        return False
+    claim_numbers = _numeric_literals(claim.get("text"))
+    if len(claim_numbers) <= 1:
+        return False
+    relevant_numbers = claim_numbers - _numeric_literals(question)
+    return bool(_numeric_literals(raw_value)) and len(relevant_numbers) > 1
 
 
 def _content_tokens(value: Any) -> set:
@@ -143,9 +208,9 @@ def _extract_or_options(question: str) -> List[str]:
     # The comparison marker identifies the option-list boundary without
     # treating commas inside titles as separators.
     marker_match = re.search(
-        r"\b(?:first|earlier|older|oldest|less|fewer|smaller|lowest|shorter|"
-        r"most\s+recent(?:ly)?|latest|later|younger|newer|newest|more|larger|highest|longer)\b"
-        r"[^,?]*,\s*(.+?)\s+or\s+(.+)$",
+        r"\b(?:first|earlier|older|oldest|less|fewer|smaller|lowest|lower|shorter|"
+        r"most\s+recent(?:ly)?|latest|later|younger|newer|newest|more|larger|greater|higher|highest|longer)\b"
+        r"[^,?]*,\s*(.+)\s+or\s+(.+)$",
         text,
         re.IGNORECASE,
     )
@@ -218,10 +283,13 @@ def build_answer_intent(
         if re.search(r"\b(same|both)\b", lower):
             deterministic_operation = "compare_equal"
             answer_role = "boolean"
-        elif re.search(r"\b(first|earlier|older|oldest|less|fewer|smaller|lowest|shorter)\b", lower):
+        elif re.search(r"\bbest\b.*\b(?:ranking|rank)\b", lower):
             deterministic_operation = "compare_min"
             answer_role = "option"
-        elif re.search(r"\b(most recent(?:ly)?|latest|later|younger|newer|newest|more|larger|highest|longer)\b", lower):
+        elif re.search(r"\b(first|earlier|older|oldest|less|fewer|smaller|lowest|lower|shorter)\b", lower):
+            deterministic_operation = "compare_min"
+            answer_role = "option"
+        elif re.search(r"\b(most recent(?:ly)?|latest|later|younger|newer|newest|more|larger|greater|higher|highest|longer)\b", lower):
             deterministic_operation = "compare_max"
             answer_role = "option"
     elif question_type == "bridge":
@@ -266,7 +334,10 @@ def build_answer_intent(
     analyzer_family = infer_relation_family(analyzer_relation, expected_answer_type) if analyzer_relation else "generic"
     focused_family = infer_relation_family(_focused_relation_clause(question), expected_answer_type)
     slot_family = infer_relation_family(slot_relations[-1], expected_answer_type) if slot_relations else "generic"
-    ordered_date_families = {"birth_date", "death_date", "release_date", "end_date"}
+    ordered_date_families = {
+        "birth_date", "creation_date", "death_date", "end_date",
+        "formation_date", "release_date",
+    }
     focused_override = bool(
         operation in {"compare_min", "compare_max"}
         and focused_family in ordered_date_families
@@ -302,6 +373,125 @@ def build_answer_intent(
         "deterministic_operation": deterministic_operation,
         "relation_source": relation_source,
         "relation_override": focused_override,
+    }
+
+
+def build_comparison_output_contract(
+    question: str,
+    state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Describe the derived comparison output without creating an evidence slot."""
+    state = state or {}
+    if str(state.get("question_type") or "") != "comparison":
+        return {}
+    intent = build_answer_intent(
+        question,
+        state.get("question_type"),
+        state.get("answer_type"),
+        state.get("answer_slots") or [],
+        state.get("answer_intent"),
+    )
+    operation = str(intent.get("operation") or "unknown")
+    output_role = "boolean" if operation == "compare_equal" else "option"
+    options = list(intent.get("option_entities") or [])[:4]
+    normalized_question = normalize_text(question)
+    if len(options) != 2 or any(
+        not normalize_text(option) or normalize_text(option) not in normalized_question
+        for option in options
+    ):
+        return {}
+    return {
+        "operation": operation,
+        "option_entities": options,
+        "output_role": output_role,
+        "expected_answer_type": intent.get("expected_answer_type") or state.get("answer_type"),
+        "derived_output": True,
+    }
+
+
+def validate_final_comparison_commit(
+    relation_trace: Optional[Dict[str, Any]],
+    output_contract: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Validate a comparison candidate for finalization-only deterministic commit."""
+    relation_trace = relation_trace or {}
+    output_contract = output_contract or {}
+    result = str(relation_trace.get("counterfactual_answer_candidate") or "").strip()
+    branches = relation_trace.get("comparison_branches") or []
+    answer_intent = relation_trace.get("answer_intent") or {}
+    relation_family = str(answer_intent.get("relation_family") or "generic")
+
+    def rejected(reason: str) -> Dict[str, Any]:
+        return {
+            "eligible": False,
+            "candidate": result or None,
+            "committed_claim_ids": [],
+            "blocked_reason": reason,
+            "commit_confidence": "blocked",
+            "relation_family": relation_family,
+            "relation_value_type_valid": (
+                False if reason == "relation_value_type_mismatch" else None
+            ),
+        }
+
+    if not output_contract:
+        return rejected("missing_output_contract")
+    if not relation_trace.get("comparison_branch_executable"):
+        return rejected(
+            str(relation_trace.get("comparison_branch_failure_reason") or "branch_not_executable")
+        )
+    if len(branches) != 2:
+        return rejected("requires_exactly_two_branches")
+    if not result:
+        return rejected("missing_comparison_result")
+
+    options = [str(option).strip() for option in output_contract.get("option_entities") or []]
+    if output_contract.get("output_role") == "boolean":
+        if normalize_text(result) not in {"yes", "no"}:
+            return rejected("result_is_not_boolean")
+        canonical_result = normalize_text(result)
+    else:
+        matching_options = [option for option in options if normalize_text(option) == normalize_text(result)]
+        if len(matching_options) != 1:
+            return rejected("result_is_not_unique_question_option")
+        canonical_result = matching_options[0]
+
+    committed_claim_ids: List[str] = []
+    for branch in branches:
+        if branch.get("status") != "supported":
+            return rejected("incomplete_or_conflicted_branch")
+        path_type = str(branch.get("path_type") or "")
+        if path_type not in {"direct", "one_hop"}:
+            return rejected("slot_associated_path_rejected")
+        if not branch.get("value_claim_id") or not branch.get("provenance_doc_ids"):
+            return rejected("incomplete_branch_provenance")
+        if path_type == "one_hop" and not branch.get("intermediate_claim_id"):
+            return rejected("incomplete_one_hop_provenance")
+        if (
+            branch.get("provenance_entity_match_status") == "incompatible"
+            or branch.get("provenance_entity_compatible") is False
+        ):
+            return rejected("provenance_entity_mismatch")
+        if branch.get("numeric_value_ambiguous"):
+            return rejected("ambiguous_numeric_provenance")
+        committed_claim_ids.extend(str(claim_id) for claim_id in branch.get("claim_ids") or [])
+
+    if relation_family not in COMMIT_SAFE_COMPARISON_RELATIONS:
+        return rejected("relation_family_not_commit_safe")
+    expected_value_types = COMMIT_RELATION_VALUE_TYPES.get(relation_family) or set()
+    if expected_value_types and any(
+        branch.get("value_type") not in expected_value_types for branch in branches
+    ):
+        return rejected("relation_value_type_mismatch")
+
+    return {
+        "eligible": True,
+        "candidate": canonical_result,
+        "committed_claim_ids": list(dict.fromkeys(committed_claim_ids)),
+        "blocked_reason": None,
+        "commit_confidence": "strict",
+        "relation_family": relation_family,
+        "relation_value_type_valid": True,
     }
 
 
@@ -341,16 +531,17 @@ def repair_answer_slot_topology(
         return slot
 
     options = extract_comparison_options(question, repaired)
-    is_comparison = str(question_type) == "comparison" or len(options) == 2
+    is_comparison = str(question_type) == "comparison"
     if is_comparison:
         operands = [slot for slot in repaired if slot.get("slot_role") == "comparison_operand"]
         while len(operands) < 2:
             operands.append(add_slot("comparison_operand", f"Resolve comparison operand {len(operands) + 1}"))
         final_slots = [slot for slot in repaired if slot.get("slot_role") == "final_answer"]
-        final_slot = final_slots[-1] if final_slots else add_slot("final_answer", "Resolve the final comparison answer")
-        final_slot["depends_on"] = list(dict.fromkeys(
-            list(final_slot.get("depends_on") or []) + [str(slot.get("slot_id")) for slot in operands[:2]]
-        ))
+        for final_slot in final_slots:
+            final_slot["derived_output"] = True
+            final_slot["depends_on"] = list(dict.fromkeys(
+                list(final_slot.get("depends_on") or []) + [str(slot.get("slot_id")) for slot in operands[:2]]
+            ))
         return repaired
 
     intermediates = [slot for slot in repaired if slot.get("slot_role") == "intermediate_entity"]
@@ -477,9 +668,15 @@ def _relation_matches(intent: Dict[str, Any], claim: Dict[str, Any]) -> bool:
     predicate_text = " ".join((str(claim.get("predicate") or ""), str(claim.get("text") or "")))
     if family != "generic":
         relation_answer_type = intent.get("expected_answer_type")
-        if family in {"birth_date", "death_date", "release_date", "end_date"}:
+        if family in {
+            "birth_date", "creation_date", "death_date", "end_date",
+            "formation_date", "release_date",
+        }:
             relation_answer_type = "date"
-        return infer_relation_family(predicate_text, relation_answer_type) == family
+        inferred_family = infer_relation_family(predicate_text, relation_answer_type)
+        if family == "creation_date" and inferred_family == "release_date":
+            return True
+        return inferred_family == family
     target_tokens = _content_tokens(intent.get("target_relation"))
     return bool(target_tokens and target_tokens.intersection(_content_tokens(predicate_text)))
 
@@ -653,7 +850,7 @@ def _comparison_value(claim: Dict[str, Any], operation: str) -> Any:
     return normalize_text(value)
 
 
-def execute_comparison(
+def _execute_comparison_strict_slots(
     intent: Dict[str, Any],
     state: Dict[str, Any],
     docs: Optional[List[Dict[str, Any]]] = None,
@@ -902,6 +1099,401 @@ def execute_comparison(
     }
 
 
+def _comparison_entities_match(left: Any, right: Any) -> bool:
+    return bool(
+        normalize_text(left) == normalize_text(right)
+        or _entity_mentioned(left, right)
+        or _entity_mentioned(right, left)
+    )
+
+
+def build_comparison_branches(
+    question: str,
+    state: Dict[str, Any],
+    docs: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Build at most one-hop option-to-value branches from supported claims."""
+    started = time.perf_counter()
+    slots = state.get("answer_slots") or []
+    intent = build_answer_intent(
+        question,
+        state.get("question_type"),
+        state.get("answer_type"),
+        slots,
+        state.get("answer_intent"),
+    )
+    operation = str(intent.get("operation") or "unknown")
+    options = [
+        str(option).strip()
+        for option in intent.get("option_entities") or []
+        if str(option).strip()
+    ][:2]
+    slots_by_id = {str(slot.get("slot_id")): slot for slot in slots}
+    claims = [
+        claim for claim in state.get("claims") or []
+        if claim.get("support_status") == "support"
+        and claim.get("claim_id")
+        and claim.get("subject")
+        and claim.get("object") not in (None, "")
+    ]
+    content_by_doc_id = {
+        str(doc.get("id", f"doc_{index}")): str(doc.get("contents", doc.get("content", "")))
+        for index, doc in enumerate(docs or [])
+    }
+    title_by_doc_id = _doc_title_map(docs)
+
+    def claim_title_match_status(claim: Dict[str, Any], entity: Any) -> str:
+        if not docs:
+            return "unknown"
+        title = title_by_doc_id.get(str(claim.get("doc_id") or ""), "")
+        return _provenance_title_match_status(title, entity)
+
+    def claim_title_matches_entity(claim: Dict[str, Any], entity: Any) -> Optional[bool]:
+        status = claim_title_match_status(claim, entity)
+        if status == "compatible":
+            return True
+        if status == "incompatible":
+            return False
+        return None
+
+    def combine_title_match_statuses(*statuses: str) -> str:
+        if "incompatible" in statuses:
+            return "incompatible"
+        if statuses and all(status == "compatible" for status in statuses):
+            return "compatible"
+        return "unknown"
+
+    def title_match_compatibility(status: str) -> Optional[bool]:
+        if status == "compatible":
+            return True
+        if status == "incompatible":
+            return False
+        return None
+
+    def claim_provenance_valid(claim: Dict[str, Any]) -> bool:
+        doc_id = str(claim.get("doc_id") or "")
+        if not doc_id:
+            return False
+        if not docs or doc_id not in content_by_doc_id:
+            return True
+        content = content_by_doc_id.get(doc_id, "")
+        return bool(
+            content
+            and _entity_mentioned(claim.get("subject"), content)
+            and _entity_mentioned(claim.get("object"), content)
+        )
+
+    def slot_conflicted(claim: Dict[str, Any]) -> bool:
+        slot = slots_by_id.get(str(claim.get("slot_id"))) or {}
+        return bool(slot.get("status") == "conflicted" or slot.get("conflicting_claim_ids"))
+
+    def opposite_endpoint(claim: Dict[str, Any], anchor: Any) -> Optional[str]:
+        subject = str(claim.get("subject") or "").strip()
+        object_value = str(claim.get("object") or "").strip()
+        subject_match = _comparison_entities_match(subject, anchor)
+        object_match = _comparison_entities_match(object_value, anchor)
+        if subject_match == object_match:
+            return None
+        return object_value if subject_match else subject
+
+    branches = []
+    for option in options:
+        paths = []
+        for value_claim in claims:
+            if not _relation_matches(intent, value_claim) or slot_conflicted(value_claim):
+                continue
+            direct_value = opposite_endpoint(value_claim, option)
+            if direct_value and claim_provenance_valid(value_claim):
+                paths.append({
+                    "path_type": "direct",
+                    "intermediate_entity": None,
+                    "intermediate_claim": None,
+                    "value_claim": value_claim,
+                    "raw_value": direct_value,
+                    "provenance_entity_compatible": claim_title_matches_entity(
+                        value_claim, option
+                    ),
+                    "provenance_entity_match_status": claim_title_match_status(
+                        value_claim, option
+                    ),
+                })
+            value_slot = slots_by_id.get(str(value_claim.get("slot_id"))) or {}
+            slot_option = value_slot.get("comparison_option")
+            if (
+                not direct_value
+                and slot_option
+                and _comparison_entities_match(slot_option, option)
+                and not any(
+                    _comparison_entities_match(endpoint, other_option)
+                    for other_option in options if not _comparison_entities_match(other_option, option)
+                    for endpoint in (value_claim.get("subject"), value_claim.get("object"))
+                )
+                and claim_provenance_valid(value_claim)
+            ):
+                paths.append({
+                    "path_type": "slot_associated",
+                    "intermediate_entity": str(value_claim.get("subject") or "").strip() or None,
+                    "intermediate_claim": None,
+                    "value_claim": value_claim,
+                    "raw_value": str(value_claim.get("object") or "").strip(),
+                    "provenance_entity_compatible": claim_title_matches_entity(
+                        value_claim, option
+                    ),
+                    "provenance_entity_match_status": claim_title_match_status(
+                        value_claim, option
+                    ),
+                })
+
+        for bridge_claim in claims:
+            if _relation_matches(intent, bridge_claim) or slot_conflicted(bridge_claim):
+                continue
+            intermediate = opposite_endpoint(bridge_claim, option)
+            if not intermediate or not claim_provenance_valid(bridge_claim):
+                continue
+            for value_claim in claims:
+                if value_claim is bridge_claim:
+                    continue
+                if not _relation_matches(intent, value_claim) or slot_conflicted(value_claim):
+                    continue
+                raw_value = opposite_endpoint(value_claim, intermediate)
+                if not raw_value or not claim_provenance_valid(value_claim):
+                    continue
+                if _comparison_entities_match(raw_value, option) or _comparison_entities_match(raw_value, intermediate):
+                    continue
+                paths.append({
+                    "path_type": "one_hop",
+                    "intermediate_entity": intermediate,
+                    "intermediate_claim": bridge_claim,
+                    "value_claim": value_claim,
+                    "raw_value": raw_value,
+                    "provenance_entity_compatible": title_match_compatibility(
+                        combine_title_match_statuses(
+                            claim_title_match_status(bridge_claim, option),
+                            claim_title_match_status(value_claim, intermediate),
+                        )
+                    ),
+                    "provenance_entity_match_status": combine_title_match_statuses(
+                        claim_title_match_status(bridge_claim, option),
+                        claim_title_match_status(value_claim, intermediate),
+                    ),
+                })
+
+        parsed_paths = []
+        for path in paths:
+            synthetic_claim = dict(path["value_claim"])
+            synthetic_claim["object"] = path["raw_value"]
+            value = _comparison_value(synthetic_claim, operation)
+            if value not in (None, ""):
+                parsed_paths.append((value, path))
+        values = {}
+        for value, path in parsed_paths:
+            values.setdefault(repr(value), []).append((value, path))
+
+        rejection_reasons = []
+        selected_value = None
+        selected_path = None
+        if not values:
+            status = "incomplete"
+            rejection_reasons.append("missing_option_value_lineage")
+        elif len(values) > 1:
+            status = "conflicted"
+            rejection_reasons.append("ambiguous_option_value")
+        else:
+            status = "supported"
+            candidates = next(iter(values.values()))
+            path_rank = {"direct": 0, "one_hop": 1, "slot_associated": 2}
+            candidates.sort(key=lambda item: (
+                path_rank.get(item[1]["path_type"], 3),
+                len(item[1].get("raw_value") or ""),
+            ))
+            selected_value, selected_path = candidates[0]
+
+        intermediate_claim = selected_path.get("intermediate_claim") if selected_path else None
+        value_claim = selected_path.get("value_claim") if selected_path else None
+        numeric_value_ambiguous = _numeric_value_is_ambiguous(
+            value_claim,
+            selected_path.get("raw_value") if selected_path else None,
+            selected_value,
+            question,
+        )
+        branches.append({
+            "option": option,
+            "status": status,
+            "path_type": selected_path.get("path_type") if selected_path else None,
+            "intermediate_entity": selected_path.get("intermediate_entity") if selected_path else None,
+            "comparable_value": selected_value,
+            "raw_value": selected_path.get("raw_value") if selected_path else None,
+            "value_type": selected_value[0] if isinstance(selected_value, tuple) else type(selected_value).__name__ if selected_value is not None else None,
+            "value_precision": selected_value[4] if isinstance(selected_value, tuple) and selected_value[0] == 0 else None,
+            "intermediate_claim_id": intermediate_claim.get("claim_id") if intermediate_claim else None,
+            "value_claim_id": value_claim.get("claim_id") if value_claim else None,
+            "claim_ids": [
+                str(claim_id) for claim_id in (
+                    intermediate_claim.get("claim_id") if intermediate_claim else None,
+                    value_claim.get("claim_id") if value_claim else None,
+                ) if claim_id
+            ],
+            "provenance_doc_ids": [
+                str(doc_id) for doc_id in (
+                    intermediate_claim.get("doc_id") if intermediate_claim else None,
+                    value_claim.get("doc_id") if value_claim else None,
+                ) if doc_id
+            ],
+            "candidate_path_count": len(parsed_paths),
+            "provenance_entity_compatible": (
+                selected_path.get("provenance_entity_compatible") if selected_path else None
+            ),
+            "provenance_entity_match_status": (
+                selected_path.get("provenance_entity_match_status")
+                if selected_path else "unknown"
+            ),
+            "numeric_value_ambiguous": numeric_value_ambiguous,
+            "rejection_reasons": rejection_reasons,
+        })
+    return {
+        "intent": intent,
+        "branches": branches,
+        "build_time_ms": (time.perf_counter() - started) * 1000.0,
+    }
+
+
+def validate_comparison_branches(
+    intent: Dict[str, Any],
+    branches: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    reasons = []
+    operation = str(intent.get("operation") or "unknown")
+    if operation not in {"compare_min", "compare_max", "compare_equal"}:
+        reasons.append("comparison_operation_not_supported")
+    if operation == "compare_equal":
+        reasons.append("compare_equal_requires_canonical_normalization")
+    if len(branches) != 2:
+        reasons.append("requires_exactly_two_branches")
+    if any(branch.get("status") != "supported" for branch in branches):
+        reasons.append("incomplete_or_conflicted_branch")
+    if len(branches) == 2 and all(branch.get("status") == "supported" for branch in branches):
+        value_claim_ids = [str(branch.get("value_claim_id") or "") for branch in branches]
+        if not all(value_claim_ids) or len(set(value_claim_ids)) != 2:
+            reasons.append("value_claim_reused")
+        intermediates = [
+            normalize_text(branch.get("intermediate_entity"))
+            for branch in branches if branch.get("intermediate_entity")
+        ]
+        if len(intermediates) == 2 and len(set(intermediates)) != 2:
+            reasons.append("intermediate_entity_reused")
+        value_types = {str(branch.get("value_type")) for branch in branches}
+        if len(value_types) != 1:
+            reasons.append("operand_type_mismatch")
+        precisions = {
+            branch.get("value_precision")
+            for branch in branches if branch.get("value_precision") is not None
+        }
+        if len(precisions) > 1:
+            reasons.append("operand_date_precision_mismatch")
+    return {
+        "status": "executable" if not reasons else "invalid",
+        "executable": not reasons,
+        "failure_reason": reasons[0] if reasons else None,
+        "rejection_reasons": reasons,
+    }
+
+
+def execute_validated_comparison(
+    intent: Dict[str, Any],
+    branches: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    validation = validate_comparison_branches(intent, branches)
+    if not validation["executable"]:
+        return {**validation, "result": None, "committed_claim_ids": []}
+    operation = str(intent.get("operation"))
+    values = [branch.get("comparable_value") for branch in branches]
+    if operation == "compare_equal":
+        result = "yes" if values[0] == values[1] else "no"
+    else:
+        target = min(values) if operation == "compare_min" else max(values)
+        winners = [branch for branch in branches if branch.get("comparable_value") == target]
+        if len(winners) != 1:
+            return {
+                "status": "ambiguous", "executable": False, "result": None,
+                "failure_reason": "comparison_tie", "rejection_reasons": ["comparison_tie"],
+                "committed_claim_ids": [],
+            }
+        result = winners[0].get("option")
+    return {
+        "status": "executed",
+        "executable": True,
+        "result": result,
+        "failure_reason": None,
+        "rejection_reasons": [],
+        "committed_claim_ids": list(dict.fromkeys(
+            claim_id for branch in branches for claim_id in branch.get("claim_ids") or []
+        )),
+    }
+
+
+def execute_comparison(
+    intent: Dict[str, Any],
+    state: Dict[str, Any],
+    docs: Optional[List[Dict[str, Any]]] = None,
+    question: str = "",
+) -> Dict[str, Any]:
+    operation = str(intent.get("operation") or "unknown")
+    if operation not in {"compare_min", "compare_max", "compare_equal"}:
+        return _execute_comparison_strict_slots(intent, state, docs)
+    built = build_comparison_branches(question, {**state, "answer_intent": intent}, docs)
+    branches = built.get("branches") or []
+    execution = execute_validated_comparison(intent, branches)
+    if execution.get("executable"):
+        return {
+            "status": "executed",
+            "operator": operation,
+            "operands": [
+                {
+                    "option": branch.get("option"),
+                    "value": branch.get("comparable_value"),
+                    "claim_ids": branch.get("claim_ids") or [],
+                }
+                for branch in branches
+            ],
+            "comparison_lineage": branches,
+            "comparison_branches": branches,
+            "comparison_branch_status": "executable",
+            "comparison_branch_executable": True,
+            "comparison_branch_failure_reason": None,
+            "comparison_branch_build_time_ms": built.get("build_time_ms", 0.0),
+            "operand_binding_status": "valid",
+            "strict_comparison_executable": True,
+            "result": execution.get("result"),
+            "failure_reason": None,
+            "rejection_reasons": [],
+            "committed_claim_ids": execution.get("committed_claim_ids") or [],
+        }
+    strict = _execute_comparison_strict_slots(intent, state, docs)
+    if strict.get("strict_comparison_executable"):
+        branch_control_executable = operation != "compare_equal"
+        if not branch_control_executable:
+            strict["strict_comparison_executable"] = False
+        strict.update({
+            "comparison_branches": strict.get("comparison_lineage") or [],
+            "comparison_branch_status": "executable" if branch_control_executable else "diagnostic_only",
+            "comparison_branch_executable": branch_control_executable,
+            "comparison_branch_failure_reason": (
+                None if branch_control_executable
+                else "compare_equal_requires_canonical_normalization"
+            ),
+            "comparison_branch_build_time_ms": built.get("build_time_ms", 0.0),
+        })
+        return strict
+    strict.update({
+        "comparison_branches": branches,
+        "comparison_branch_status": "invalid",
+        "comparison_branch_executable": False,
+        "comparison_branch_failure_reason": execution.get("failure_reason"),
+        "comparison_branch_build_time_ms": built.get("build_time_ms", 0.0),
+    })
+    return strict
+
+
 def evaluate_answer_semantics(
     question: str,
     state: Dict[str, Any],
@@ -1069,12 +1661,20 @@ def evaluate_answer_semantics(
             "rejection_reasons": [] if eligible else ["candidate_claim_not_semantically_valid"],
         })
 
-    comparison = execute_comparison(intent, state, docs) if enable_comparison_executor else {
+    comparison = execute_comparison(intent, state, docs, question=question) if enable_comparison_executor else {
         "status": "disabled", "operator": intent.get("operation"), "operands": [], "result": None,
         "comparison_lineage": [], "operand_binding_status": "disabled",
         "strict_comparison_executable": False, "failure_reason": "comparison_executor_disabled",
         "rejection_reasons": [], "committed_claim_ids": [],
     }
+    comparison_status = str(comparison.get("status") or "not_attempted")
+    derived_answer_status = {
+        "executed": "executed",
+        "ready": "executable",
+        "ambiguous": "ambiguous",
+        "incomplete_operands": "invalid",
+        "invalid_operands": "invalid",
+    }.get(comparison_status, "not_attempted")
     eligible_bindings = [item for item in bindings if item.get("eligible") and item.get("candidate")]
     unique_candidates = {}
     for item in eligible_bindings:
@@ -1168,6 +1768,14 @@ def evaluate_answer_semantics(
         "claim_bindings": bindings,
         "comparison_execution": comparison,
         "comparison_execution_status": comparison.get("status"),
+        "derived_answer_status": derived_answer_status,
+        "comparison_branches": comparison.get("comparison_branches") or [],
+        "comparison_branch_status": comparison.get("comparison_branch_status"),
+        "comparison_branch_executable": bool(comparison.get("comparison_branch_executable")),
+        "comparison_branch_failure_reason": comparison.get("comparison_branch_failure_reason"),
+        "comparison_branch_build_time_ms": float(
+            comparison.get("comparison_branch_build_time_ms") or 0.0
+        ),
         "comparison_lineage": comparison.get("comparison_lineage") or [],
         "operand_binding_status": comparison.get("operand_binding_status"),
         "strict_comparison_executable": bool(comparison.get("strict_comparison_executable")),

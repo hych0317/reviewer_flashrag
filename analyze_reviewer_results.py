@@ -340,6 +340,45 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
     provenance_rebind_candidates = 0
     date_precision_mismatch = 0
     binding_directions = Counter()
+    comparison_items = 0
+    comparison_operand_complete = 0
+    comparison_extra_final_slot = 0
+    comparison_forced_with_complete_operands = 0
+    comparison_ready_with_complete_operands = 0
+    comparison_lineage_crossed = 0
+    comparison_invalid_reasons = Counter()
+    diagnostic_behavior_mutations = 0
+    comparison_view_applied = 0
+    derived_slots_hidden_from_reviewer = 0
+    derived_retrieval_plans_dropped = 0
+    non_comparison_prompt_mutated = 0
+    non_comparison_query_mutated = 0
+    non_comparison_output_mutated = 0
+    comparison_branch_executable = 0
+    comparison_branch_executable_correct = 0
+    comparison_branch_executable_wrong = 0
+    comparison_branch_fallback = 0
+    comparison_branch_fallback_correct = 0
+    comparison_guidance_applied = 0
+    comparison_branch_build_time_ms = 0.0
+    comparison_branch_failure_reasons = Counter()
+    comparison_branch_by_operation = Counter()
+    comparison_option_or_intermediate_output = 0
+    comparison_output_contract_available = 0
+    comparison_output_contract_applied = 0
+    comparison_commit_eligible = 0
+    comparison_commit_eligible_correct = 0
+    comparison_final_commits = 0
+    comparison_final_commit_correct = 0
+    comparison_slot_associated_rejected = 0
+    comparison_guided_generation = 0
+    comparison_saved_generation = 0
+    comparison_commit_blocked_reasons = Counter()
+    comparison_finalization_modes = Counter()
+    comparison_commit_confidences = Counter()
+    comparison_commit_relation_families = Counter()
+    comparison_commit_relation_value_types = Counter()
+    provenance_entity_match_statuses = Counter()
 
     for item in items:
         trace = diagnostic_of(item)
@@ -361,6 +400,8 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
 
         state = output_of(item).get("evidence_state") or {}
         final_trace = trace.get("final_trace") or {}
+        commit_eligible = False
+        final_commit = False
         question_type_repaired += int(bool(
             final_trace.get("question_type_repaired") or state.get("question_type_repaired")
         ))
@@ -387,6 +428,115 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
 
         for slot in state.get("answer_slots") or []:
             slot_statuses[str(slot.get("status") or "unknown")] += 1
+
+        if state.get("question_type") == "comparison":
+            comparison_items += 1
+            slots = state.get("answer_slots") or []
+            operands = [slot for slot in slots if slot.get("slot_role") == "comparison_operand"]
+            operands_complete = bool(len(operands) >= 2) and all(
+                slot.get("status") == "supported" for slot in operands
+            )
+            comparison_operand_complete += int(operands_complete)
+            comparison_extra_final_slot += int(any(
+                slot.get("slot_role") == "final_answer"
+                and not slot.get("derived_output")
+                for slot in slots
+            ))
+            decision = str(state.get("decision") or "")
+            comparison_forced_with_complete_operands += int(
+                operands_complete and decision == "force_answer"
+            )
+            comparison_ready_with_complete_operands += int(
+                operands_complete and decision == "ready_to_answer"
+            )
+            comparison_view_applied += int(bool(
+                final_trace.get("comparison_view_applied")
+                or state.get("comparison_view_applied")
+            ))
+            derived_slots_hidden_from_reviewer += int(
+                final_trace.get("derived_slots_hidden_from_reviewer")
+                or state.get("derived_slots_hidden_from_reviewer")
+                or 0
+            )
+            derived_retrieval_plans_dropped += int(
+                final_trace.get("derived_retrieval_plans_dropped")
+                or state.get("derived_retrieval_plans_dropped")
+                or 0
+            )
+            output_contract_applied = bool(
+                final_trace.get("comparison_output_contract_applied")
+                or trace.get("comparison_output_contract_applied")
+            )
+            output_contract_available = bool(
+                final_trace.get("comparison_output_contract_available")
+                or trace.get("comparison_output_contract_available")
+                or final_trace.get("comparison_output_contract")
+                or trace.get("comparison_output_contract")
+            )
+            commit_eligible = bool(
+                final_trace.get("comparison_commit_eligible")
+                or trace.get("comparison_commit_eligible")
+            )
+            final_commit = bool(
+                final_trace.get("comparison_final_commit_saved_generation")
+                or trace.get("comparison_final_commit_saved_generation")
+            )
+            comparison_output_contract_available += int(output_contract_available)
+            comparison_output_contract_applied += int(output_contract_applied)
+            comparison_commit_eligible += int(commit_eligible)
+            comparison_final_commits += int(final_commit)
+            comparison_slot_associated_rejected += int(bool(
+                final_trace.get("comparison_slot_associated_rejected")
+                or trace.get("comparison_slot_associated_rejected")
+            ))
+            comparison_guided_generation += int(bool(
+                final_trace.get("comparison_guided_generation")
+                or trace.get("comparison_guided_generation")
+            ))
+            comparison_saved_generation += int(final_commit)
+            blocked_reason = (
+                final_trace.get("comparison_commit_blocked_reason")
+                or trace.get("comparison_commit_blocked_reason")
+            )
+            if blocked_reason:
+                comparison_commit_blocked_reasons[str(blocked_reason)] += 1
+            commit_confidence = (
+                final_trace.get("comparison_commit_confidence")
+                or trace.get("comparison_commit_confidence")
+            )
+            if commit_confidence:
+                comparison_commit_confidences[str(commit_confidence)] += 1
+            commit_relation_family = (
+                final_trace.get("comparison_commit_relation_family")
+                or trace.get("comparison_commit_relation_family")
+            )
+            if commit_relation_family:
+                comparison_commit_relation_families[str(commit_relation_family)] += 1
+            relation_value_type_valid = (
+                final_trace.get("comparison_commit_relation_value_type_valid")
+                if "comparison_commit_relation_value_type_valid" in final_trace
+                else trace.get("comparison_commit_relation_value_type_valid")
+            )
+            if relation_value_type_valid is not None:
+                comparison_commit_relation_value_types[
+                    "valid" if relation_value_type_valid else "invalid"
+                ] += 1
+            finalization_mode = (
+                final_trace.get("comparison_finalization_mode")
+                or trace.get("comparison_finalization_mode")
+                or "unknown"
+            )
+            comparison_finalization_modes[str(finalization_mode)] += 1
+        else:
+            non_comparison_prompt_mutated += int(bool(
+                final_trace.get("non_comparison_prompt_mutated")
+            ))
+            non_comparison_query_mutated += int(bool(
+                final_trace.get("non_comparison_query_mutated")
+            ))
+            non_comparison_output_mutated += int(bool(
+                final_trace.get("non_comparison_output_mutated")
+            ))
 
         policy = output_of(item).get("adoption_policy") or {}
         candidate_source = str(policy.get("candidate_source") or "null")
@@ -428,6 +578,10 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
             intent_conflicts += int(bool(relation_trace.get("intent_conflict")))
             strict = bool(relation_trace.get("strict_comparison_executable"))
             strict_comparison_executable += int(strict)
+            for branch in relation_trace.get("comparison_branches") or []:
+                provenance_entity_match_statuses[str(
+                    branch.get("provenance_entity_match_status") or "unknown"
+                )] += 1
             counterfactual = relation_trace.get("counterfactual_answer_candidate")
             if counterfactual:
                 counterfactual_candidates += 1
@@ -457,6 +611,30 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
                 or trace.get("semantic_guidance_applied")
             ))
             comparison = relation_trace.get("comparison_execution") or {}
+            branch_executable = bool(relation_trace.get("comparison_branch_executable"))
+            comparison_branch_executable += int(branch_executable)
+            comparison_branch_build_time_ms += float(
+                relation_trace.get("comparison_branch_build_time_ms") or 0.0
+            )
+            comparison_branch_by_operation[
+                f"{operation}:{'executable' if branch_executable else 'fallback'}"
+            ] += 1
+            if relation_trace.get("comparison_branch_failure_reason"):
+                comparison_branch_failure_reasons[str(
+                    relation_trace.get("comparison_branch_failure_reason")
+                )] += 1
+            diagnostic_behavior_mutations += int(any(
+                relation_trace.get(name)
+                for name in (
+                    "diagnostic_state_mutated", "diagnostic_query_mutated",
+                    "diagnostic_prompt_mutated", "diagnostic_answer_mutated",
+                )
+            ))
+            comparison_lineage_crossed += int(
+                "operand_lineage_crossed" in (comparison.get("rejection_reasons") or [])
+            )
+            if comparison.get("failure_reason"):
+                comparison_invalid_reasons[str(comparison.get("failure_reason"))] += 1
             for lineage in comparison.get("comparison_lineage") or []:
                 provenance_rebind_candidates += int(bool(
                     lineage.get("alternative_intermediate_provenance_doc_ids")
@@ -493,6 +671,52 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
         bucket = gold_recall_bucket(trace)
         forced = has_forced(output_of(item).get("review_history") or [], output_of(item))
         f1 = float(metric.get("f1", 0.0))
+        if state.get("question_type") == "comparison":
+            comparison_candidate = (
+                (final_trace.get("answer_decision") or {}).get("selected_answer_candidate")
+                or (output_of(item).get("adoption_policy") or {}).get("selected_answer_candidate")
+                or relation_trace.get("counterfactual_answer_candidate")
+            )
+            comparison_candidate_correct = candidate_is_gold(item, comparison_candidate)
+            comparison_commit_eligible_correct += int(
+                commit_eligible and comparison_candidate_correct
+            )
+            comparison_final_commit_correct += int(
+                final_commit and comparison_candidate_correct
+            )
+        if state.get("question_type") == "comparison":
+            branch_executable = bool(relation_trace.get("comparison_branch_executable"))
+            branch_candidate_correct = candidate_is_gold(
+                item, relation_trace.get("counterfactual_answer_candidate")
+            )
+            comparison_branch_executable_correct += int(
+                branch_executable and branch_candidate_correct
+            )
+            comparison_branch_executable_wrong += int(
+                branch_executable and not branch_candidate_correct
+            )
+            fallback = bool(
+                final_trace.get("comparison_fallback_to_patch2")
+                or state.get("comparison_fallback_to_patch2")
+            )
+            comparison_branch_fallback += int(fallback)
+            comparison_branch_fallback_correct += int(fallback and f1 > 0)
+            comparison_guidance_applied += int(bool(
+                final_trace.get("comparison_guidance_applied")
+            ))
+            pred_norm = normalized_answer(str(output_of(item).get("pred") or ""))
+            options = [
+                normalized_answer(str(option))
+                for option in ((state.get("answer_intent") or {}).get("option_entities") or [])
+            ]
+            intermediates = [
+                normalized_answer(str(branch.get("intermediate_entity") or ""))
+                for branch in relation_trace.get("comparison_branches") or []
+                if branch.get("intermediate_entity")
+            ]
+            comparison_option_or_intermediate_output += int(bool(
+                pred_norm and pred_norm in set(options + intermediates) and f1 == 0
+            ))
         if answer_policy_mismatch(item):
             policy_mismatch += 1
             policy_mismatch_by_commit_mode[commit_mode] += 1
@@ -567,6 +791,36 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
         print(f"semantic_guidance_applied_rate\t{semantic_guidance_applied / traced:.4f}")
         print(f"provenance_rebind_candidates\t{provenance_rebind_candidates}")
         print(f"date_precision_mismatch\t{date_precision_mismatch}")
+        print(f"comparison_operand_complete_rate\t{comparison_operand_complete / comparison_items:.4f}" if comparison_items else "comparison_operand_complete_rate\t0.0000")
+        print(f"comparison_extra_final_slot_rate\t{comparison_extra_final_slot / comparison_items:.4f}" if comparison_items else "comparison_extra_final_slot_rate\t0.0000")
+        print(f"comparison_ready_with_complete_operands\t{comparison_ready_with_complete_operands}")
+        print(f"comparison_forced_with_complete_operands\t{comparison_forced_with_complete_operands}")
+        print(f"comparison_lineage_crossed\t{comparison_lineage_crossed}")
+        print(f"diagnostic_behavior_mutation_rate\t{diagnostic_behavior_mutations / relation_trace_count:.4f}" if relation_trace_count else "diagnostic_behavior_mutation_rate\t0.0000")
+        print(f"comparison_view_applied_rate\t{comparison_view_applied / comparison_items:.4f}" if comparison_items else "comparison_view_applied_rate\t0.0000")
+        print(f"derived_slots_hidden_from_reviewer\t{derived_slots_hidden_from_reviewer}")
+        print(f"derived_retrieval_plans_dropped\t{derived_retrieval_plans_dropped}")
+        non_comparison_items = traced - comparison_items
+        print(f"non_comparison_prompt_mutation_rate\t{non_comparison_prompt_mutated / non_comparison_items:.4f}" if non_comparison_items else "non_comparison_prompt_mutation_rate\t0.0000")
+        print(f"non_comparison_query_mutation_rate\t{non_comparison_query_mutated / non_comparison_items:.4f}" if non_comparison_items else "non_comparison_query_mutation_rate\t0.0000")
+        print(f"non_comparison_output_mutation_rate\t{non_comparison_output_mutated / non_comparison_items:.4f}" if non_comparison_items else "non_comparison_output_mutation_rate\t0.0000")
+        print(f"comparison_branch_executable_coverage\t{comparison_branch_executable / comparison_items:.4f}" if comparison_items else "comparison_branch_executable_coverage\t0.0000")
+        print(f"comparison_branch_executable_accuracy\t{comparison_branch_executable_correct / comparison_branch_executable:.4f}" if comparison_branch_executable else "comparison_branch_executable_accuracy\t0.0000")
+        print(f"comparison_branch_executable_wrong\t{comparison_branch_executable_wrong}")
+        print(f"comparison_branch_fallback_rate\t{comparison_branch_fallback / comparison_items:.4f}" if comparison_items else "comparison_branch_fallback_rate\t0.0000")
+        print(f"comparison_branch_fallback_accuracy\t{comparison_branch_fallback_correct / comparison_branch_fallback:.4f}" if comparison_branch_fallback else "comparison_branch_fallback_accuracy\t0.0000")
+        print(f"comparison_guidance_applied_rate\t{comparison_guidance_applied / comparison_items:.4f}" if comparison_items else "comparison_guidance_applied_rate\t0.0000")
+        print(f"comparison_branch_build_time_ms_avg\t{comparison_branch_build_time_ms / comparison_items:.4f}" if comparison_items else "comparison_branch_build_time_ms_avg\t0.0000")
+        print(f"comparison_option_or_intermediate_output\t{comparison_option_or_intermediate_output}")
+        print(f"comparison_output_contract_available_rate\t{comparison_output_contract_available / comparison_items:.4f}" if comparison_items else "comparison_output_contract_available_rate\t0.0000")
+        print(f"comparison_output_contract_coverage\t{comparison_output_contract_applied / comparison_items:.4f}" if comparison_items else "comparison_output_contract_coverage\t0.0000")
+        print(f"comparison_final_commit_eligible_rate\t{comparison_commit_eligible / comparison_items:.4f}" if comparison_items else "comparison_final_commit_eligible_rate\t0.0000")
+        print(f"comparison_final_commit_eligible_accuracy\t{comparison_commit_eligible_correct / comparison_commit_eligible:.4f}" if comparison_commit_eligible else "comparison_final_commit_eligible_accuracy\t0.0000")
+        print(f"comparison_final_commit_rate\t{comparison_final_commits / comparison_items:.4f}" if comparison_items else "comparison_final_commit_rate\t0.0000")
+        print(f"comparison_final_commit_accuracy\t{comparison_final_commit_correct / comparison_final_commits:.4f}" if comparison_final_commits else "comparison_final_commit_accuracy\t0.0000")
+        print(f"comparison_guided_generation_rate\t{comparison_guided_generation / comparison_items:.4f}" if comparison_items else "comparison_guided_generation_rate\t0.0000")
+        print(f"comparison_final_commit_saved_generation\t{comparison_saved_generation}")
+        print(f"comparison_slot_associated_rejected\t{comparison_slot_associated_rejected}")
         total_answer_support = answer_supported_count + answer_unsupported_count
         print(f"answer_unsupported_rate\t{answer_unsupported_count / total_answer_support:.4f}" if total_answer_support else "answer_unsupported_rate\t0.0000")
         print(f"verifier_enabled_rate\t{verifier_enabled_count / traced:.4f}")
@@ -582,6 +836,18 @@ def print_retrieval_summary(items: List[Dict[str, Any]]) -> None:
     print_counter("intent_sources", intent_sources)
     print_counter("operand_binding_statuses", operand_binding_statuses)
     print_counter("binding_directions", binding_directions)
+    print_counter("comparison_invalid_reasons", comparison_invalid_reasons)
+    print_counter("comparison_branch_failure_reasons", comparison_branch_failure_reasons)
+    print_counter("comparison_branch_by_operation", comparison_branch_by_operation)
+    print_counter("comparison_commit_blocked_reasons", comparison_commit_blocked_reasons)
+    print_counter("comparison_finalization_modes", comparison_finalization_modes)
+    print_counter("comparison_commit_confidences", comparison_commit_confidences)
+    print_counter("comparison_commit_relation_families", comparison_commit_relation_families)
+    print_counter(
+        "comparison_commit_relation_value_types",
+        comparison_commit_relation_value_types,
+    )
+    print_counter("provenance_entity_match_statuses", provenance_entity_match_statuses)
     print_counter("policy_mismatch_by_commit_mode", policy_mismatch_by_commit_mode)
     print_counter("state_consistency_blocked_reasons", state_consistency_blocked_reasons)
     print_counter("high_coverage_wrong_by_answer_type", high_coverage_wrong_by_answer_type)
@@ -659,6 +925,62 @@ def expand_paths(patterns: Iterable[str]) -> List[str]:
     return paths
 
 
+def print_paired_run_comparison(new_path: str, baseline_path: str) -> None:
+    new_items = {str(item.get("id")): item for item in load_items(new_path)}
+    baseline_items = {str(item.get("id")): item for item in load_items(baseline_path)}
+    item_ids = sorted(set(new_items).intersection(baseline_items))
+    transitions = Counter()
+    analyzer_mutated = 0
+    query_mutated = 0
+    final_docs_mutated = 0
+    prediction_mutated = 0
+    for item_id in item_ids:
+        new_item = new_items[item_id]
+        baseline_item = baseline_items[item_id]
+        new_output = output_of(new_item)
+        baseline_output = output_of(baseline_item)
+        new_trace = diagnostic_of(new_item)
+        baseline_trace = diagnostic_of(baseline_item)
+        analyzer_mutated += int(
+            (new_trace.get("question_analysis") or {})
+            != (baseline_trace.get("question_analysis") or {})
+        )
+        new_state = new_output.get("evidence_state") or {}
+        baseline_state = baseline_output.get("evidence_state") or {}
+        query_mutated += int(
+            (new_state.get("query_history") or [])
+            != (baseline_state.get("query_history") or [])
+        )
+        new_doc_ids = [str(doc.get("id")) for doc in new_output.get("retrieval_result") or []]
+        baseline_doc_ids = [
+            str(doc.get("id")) for doc in baseline_output.get("retrieval_result") or []
+        ]
+        final_docs_mutated += int(new_doc_ids != baseline_doc_ids)
+        prediction_mutated += int(
+            str(new_output.get("pred") or "") != str(baseline_output.get("pred") or "")
+        )
+        baseline_correct = float(metric_of(baseline_item).get("em", 0.0) or 0.0) > 0
+        new_correct = float(metric_of(new_item).get("em", 0.0) or 0.0) > 0
+        transitions[
+            f"{'correct' if baseline_correct else 'wrong'}->{'correct' if new_correct else 'wrong'}"
+        ] += 1
+
+    count = len(item_ids)
+    print("\npaired_run_comparison")
+    print(f"baseline\t{baseline_path}")
+    print(f"new\t{new_path}")
+    print(f"paired_items\t{count}")
+    for name, value in (
+        ("question_analysis_mutation", analyzer_mutated),
+        ("query_mutation", query_mutated),
+        ("final_doc_mutation", final_docs_mutated),
+        ("prediction_mutation", prediction_mutated),
+    ):
+        print(f"{name}_count\t{value}")
+        print(f"{name}_rate\t{value / count:.4f}" if count else f"{name}_rate\t0.0000")
+    print_counter("em_transitions", transitions)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze reviewer intermediate_data.json files.")
     parser.add_argument(
@@ -671,6 +993,10 @@ def main() -> None:
         ],
         help="Files or glob patterns to analyze.",
     )
+    parser.add_argument(
+        "--compare-to",
+        help="Baseline intermediate_data.json for paired item-level comparison.",
+    )
     args = parser.parse_args()
 
     paths = expand_paths(args.paths)
@@ -679,6 +1005,11 @@ def main() -> None:
 
     for path in paths:
         analyze_file(path)
+    if args.compare_to:
+        baseline_paths = expand_paths([args.compare_to])
+        if len(paths) != 1 or len(baseline_paths) != 1:
+            raise SystemExit("--compare-to requires exactly one new file and one baseline file.")
+        print_paired_run_comparison(paths[0], baseline_paths[0])
 
 
 if __name__ == "__main__":

@@ -28,10 +28,10 @@ from flashrag.config import Config
 from flashrag.utils import get_dataset
 
 
-PIPELINE_VERSION = "ver2_7_patch2"
-DEFAULT_RESULT_TAG = "ver2_7_patch2"
+PIPELINE_VERSION = "ver2_7_patch9"
+DEFAULT_RESULT_TAG = "ver2_7_patch9"
 STATE_SCHEMA_VERSION = "reviewer_state_v2_7"
-PROMPT_VERSION = "reviewer_prompt_v2_7_patch2"
+PROMPT_VERSION = "reviewer_prompt_v2_7_patch8"
 
 
 def build_save_note(base_note, result_tag):
@@ -80,6 +80,7 @@ def reviewer_reasoning(args):
         "enable_relation_grounding": True,
         "relation_grounding_mode": "diagnostic",
         "enable_comparison_executor": True,
+        "comparison_branch_mode": args.comparison_branch_mode,
         "deterministic_commit_scope": "none",
         "enable_deterministic_answer_commit": False,
         "generator_max_input_len": 16384,
@@ -137,6 +138,7 @@ def reviewer_multihop(args):
         "enable_relation_grounding": True,
         "relation_grounding_mode": "diagnostic",
         "enable_comparison_executor": True,
+        "comparison_branch_mode": args.comparison_branch_mode,
         "deterministic_commit_scope": "none",
         "enable_deterministic_answer_commit": False,
         "generator_max_input_len": 8192,
@@ -213,6 +215,15 @@ Examples:
                         help="Number of samples to run; use <=0 for the full split (default: 3000)")
     parser.add_argument("--result_tag", type=str, default=DEFAULT_RESULT_TAG,
                         help="Optional suffix appended to save_note for distinguishing result directories")
+    parser.add_argument(
+        "--comparison_branch_mode",
+        choices=("baseline", "strict_commit", "diagnostic", "final_only", "control"),
+        default="baseline",
+        help=(
+            "Comparison finalization mode; strict_commit commits only fully validated "
+            "branches, while baseline preserves generator behavior"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -232,6 +243,7 @@ Examples:
     print(f"Generator model: {args.generator_model or 'config default'}")
     print(f"Sample size: {args.sample_size}")
     print(f"Result tag: {args.result_tag or 'none'}")
+    print(f"Comparison branch mode: {args.comparison_branch_mode}")
     print(f"{'='*60}\n")
 
     result = method_func(args)

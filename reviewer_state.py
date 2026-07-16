@@ -13,9 +13,9 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 
-PIPELINE_VERSION = "ver2_7_patch2"
+PIPELINE_VERSION = "ver2_7_patch9"
 STATE_SCHEMA_VERSION = "reviewer_state_v2_7"
-PROMPT_VERSION = "reviewer_prompt_v2_7_patch2"
+PROMPT_VERSION = "reviewer_prompt_v2_7_patch8"
 
 
 class ReviewDecision(str, Enum):
@@ -268,6 +268,7 @@ class ReviewState:
     answer_candidate: Optional[str] = None
     answer_candidate_claim_ids: List[str] = field(default_factory=list)
     answer_intent: Dict[str, Any] = field(default_factory=dict)
+    comparison_output_contract: Dict[str, Any] = field(default_factory=dict)
     relation_grounding_trace: Dict[str, Any] = field(default_factory=dict)
     answer_decision: Dict[str, Any] = field(default_factory=dict)
     ready_guard_triggered: bool = False
@@ -305,6 +306,7 @@ class ReviewState:
             "answer_candidate",
             "answer_candidate_claim_ids",
             "answer_intent",
+            "comparison_output_contract",
             "relation_grounding_trace",
             "answer_decision",
             "ready_guard_triggered",
@@ -363,6 +365,7 @@ class ReviewState:
             if data.get("answer_candidate") is not None else None,
             answer_candidate_claim_ids=_as_str_list(data.get("answer_candidate_claim_ids")),
             answer_intent=dict(data.get("answer_intent") or {}),
+            comparison_output_contract=dict(data.get("comparison_output_contract") or {}),
             relation_grounding_trace=dict(data.get("relation_grounding_trace") or {}),
             answer_decision=dict(data.get("answer_decision") or {}),
             ready_guard_triggered=_as_bool(data.get("ready_guard_triggered")),
@@ -401,6 +404,7 @@ class ReviewState:
             "answer_candidate": self.answer_candidate,
             "answer_candidate_claim_ids": self.answer_candidate_claim_ids,
             "answer_intent": self.answer_intent,
+            "comparison_output_contract": self.comparison_output_contract,
             "relation_grounding_trace": self.relation_grounding_trace,
             "answer_decision": self.answer_decision,
             "ready_guard_triggered": self.ready_guard_triggered,
@@ -429,19 +433,39 @@ class ReviewState:
         return issues
 
     def slot_coverage(self) -> Dict[str, Any]:
-        total = len(self.answer_slots)
-        supported = sum(1 for slot in self.answer_slots if slot.status == SlotStatus.SUPPORTED)
-        conflicted = sum(1 for slot in self.answer_slots if slot.status == SlotStatus.CONFLICTED)
+        evidence_slots = self.answer_slots
+        if self.question_type == "comparison":
+            evidence_slots = [
+                slot for slot in self.answer_slots
+                if slot.slot_role != "final_answer" and not slot.extra.get("derived_output")
+            ]
+        total = len(evidence_slots)
+        supported = sum(1 for slot in evidence_slots if slot.status == SlotStatus.SUPPORTED)
+        conflicted = sum(1 for slot in evidence_slots if slot.status == SlotStatus.CONFLICTED)
         missing = sum(
-            1 for slot in self.answer_slots
+            1 for slot in evidence_slots
             if slot.status in {SlotStatus.MISSING, SlotStatus.PARTIAL}
         )
+        operand_slots = [slot for slot in self.answer_slots if slot.slot_role == "comparison_operand"]
+        operand_supported = sum(1 for slot in operand_slots if slot.status == SlotStatus.SUPPORTED)
+        operand_conflicted = sum(1 for slot in operand_slots if slot.status == SlotStatus.CONFLICTED)
+        operand_missing = sum(
+            1 for slot in operand_slots
+            if slot.status in {SlotStatus.MISSING, SlotStatus.PARTIAL}
+        )
+        operand_total = len(operand_slots)
         return {
             "total": total,
             "supported": supported,
             "conflicted": conflicted,
             "missing": missing,
             "coverage": supported / total if total else 0.0,
+            "evidence_slot_coverage": supported / total if total else 0.0,
+            "comparison_operand_coverage": operand_supported / operand_total if operand_total else 0.0,
+            "comparison_operand_total": operand_total,
+            "comparison_operand_supported": operand_supported,
+            "comparison_operand_conflicted": operand_conflicted,
+            "comparison_operand_missing": operand_missing,
         }
 
     def compact_for_reviewer(self, claim_limit: int = 16) -> Dict[str, Any]:

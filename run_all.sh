@@ -8,7 +8,8 @@ SCREEN_NAME="reviewer_experiments"
 GPU_ID="1"
 GENERATOR_MODEL="qwen2.5-7B-Instruct"
 METHOD_NAME="reviewer_reasoning"
-RESULT_TAG="ver2_7_patch2"
+RESULT_TAG="${RESULT_TAG:-ver2_7_patch9_strict}"
+COMPARISON_BRANCH_MODE="${COMPARISON_BRANCH_MODE:-baseline}"
 MAX_ITER="3"
 MAX_DOCS="12"
 SAMPLE_SIZE="1000"
@@ -82,6 +83,7 @@ echo "Generator model: ${GENERATOR_MODEL}" | tee -a "${SUMMARY_LOG}"
 echo "GPU: ${GPU_ID}" | tee -a "${SUMMARY_LOG}"
 echo "Max iter: ${MAX_ITER}" | tee -a "${SUMMARY_LOG}"
 echo "Max docs: ${MAX_DOCS}" | tee -a "${SUMMARY_LOG}"
+echo "Comparison branch mode: ${COMPARISON_BRANCH_MODE}" | tee -a "${SUMMARY_LOG}"
 echo "Sample size: ${SAMPLE_SIZE}" | tee -a "${SUMMARY_LOG}"
 echo "Split mode: ${SPLIT_MODE}" | tee -a "${SUMMARY_LOG}"
 echo "" | tee -a "${SUMMARY_LOG}"
@@ -109,6 +111,7 @@ for entry in "${DATASETS[@]}"; do
     --max_docs "${MAX_DOCS}" \
     --generator_model "${GENERATOR_MODEL}" \
     --result_tag "${RESULT_TAG}" \
+    --comparison_branch_mode "${COMPARISON_BRANCH_MODE}" \
     --sample_size "${SAMPLE_SIZE}" \
     > "${exp_log}" 2>&1
 

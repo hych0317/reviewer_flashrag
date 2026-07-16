@@ -45,17 +45,21 @@ try:
     from reviewer_answer_semantics import (
         annotate_slots_with_intent,
         build_answer_intent,
+        build_comparison_output_contract,
         evaluate_answer_semantics,
         infer_effective_question_type,
         repair_answer_slot_topology,
+        validate_final_comparison_commit,
     )
 except ImportError:
     from examples.reviewer.reviewer_answer_semantics import (
         annotate_slots_with_intent,
         build_answer_intent,
+        build_comparison_output_contract,
         evaluate_answer_semantics,
         infer_effective_question_type,
         repair_answer_slot_topology,
+        validate_final_comparison_commit,
     )
 
 
@@ -378,6 +382,18 @@ class ReviewerPipeline(BasicPipeline):
         self.enable_hybrid_retrieval = bool(self.config["enable_hybrid_retrieval"])
         relation_flag = self._config_value("enable_relation_grounding", True)
         comparison_flag = self._config_value("enable_comparison_executor", True)
+        comparison_branch_mode = str(
+            self._config_value("comparison_branch_mode", "baseline") or "baseline"
+        )
+        comparison_mode_aliases = {
+            "diagnostic": "baseline",
+            "final_only": "strict_commit",
+        }
+        comparison_finalization_mode = comparison_mode_aliases.get(
+            comparison_branch_mode, comparison_branch_mode
+        )
+        if comparison_finalization_mode not in {"baseline", "strict_commit", "control"}:
+            comparison_finalization_mode = "baseline"
         relation_mode = str(self._config_value("relation_grounding_mode", "diagnostic") or "diagnostic")
         if relation_mode not in {"diagnostic", "control"}:
             relation_mode = "diagnostic"
@@ -388,6 +404,8 @@ class ReviewerPipeline(BasicPipeline):
         self.enable_relation_grounding = bool(relation_flag)
         self.relation_grounding_mode = relation_mode
         self.enable_comparison_executor = bool(comparison_flag)
+        self.comparison_branch_mode = comparison_branch_mode
+        self.comparison_finalization_mode = comparison_finalization_mode
         self.deterministic_commit_scope = commit_scope
         self.enable_deterministic_answer_commit = bool(commit_flag) and commit_scope != "none"
 
@@ -758,6 +776,10 @@ class ReviewerPipeline(BasicPipeline):
                 "enable_relation_grounding": self.enable_relation_grounding,
                 "relation_grounding_mode": self.relation_grounding_mode,
                 "enable_comparison_executor": self.enable_comparison_executor,
+                "enable_comparison_output_contract": False,
+                "enable_comparison_output_contract_diagnostics": True,
+                "comparison_branch_mode": self.comparison_branch_mode,
+                "comparison_finalization_mode": self.comparison_finalization_mode,
                 "deterministic_commit_scope": self.deterministic_commit_scope,
                 "enable_deterministic_answer_commit": self.enable_deterministic_answer_commit,
             },
@@ -796,6 +818,22 @@ class ReviewerPipeline(BasicPipeline):
         diagnostic_trace["chain_grounding_trace"] = policy.get("chain_grounding_trace", {})
         diagnostic_trace["relation_grounding_trace"] = relation_trace
         diagnostic_trace["answer_decision"] = answer_decision
+        for key in (
+            "comparison_output_contract",
+            "comparison_output_contract_available",
+            "comparison_output_contract_applied",
+            "comparison_finalization_mode",
+            "comparison_commit_eligible",
+            "comparison_commit_blocked_reason",
+            "comparison_commit_confidence",
+            "comparison_commit_relation_family",
+            "comparison_commit_relation_value_type_valid",
+            "comparison_slot_associated_rejected",
+            "comparison_final_candidate_matches_option",
+            "comparison_guided_generation",
+            "comparison_final_commit_saved_generation",
+        ):
+            diagnostic_trace[key] = policy.get(key)
         for key in (
             "relation_grounded",
             "semantic_coverage",
@@ -920,6 +958,10 @@ class ReviewerPipeline(BasicPipeline):
                 "enable_relation_grounding": self.enable_relation_grounding,
                 "relation_grounding_mode": self.relation_grounding_mode,
                 "enable_comparison_executor": self.enable_comparison_executor,
+                "enable_comparison_output_contract": False,
+                "enable_comparison_output_contract_diagnostics": True,
+                "comparison_branch_mode": self.comparison_branch_mode,
+                "comparison_finalization_mode": self.comparison_finalization_mode,
                 "deterministic_commit_scope": self.deterministic_commit_scope,
                 "enable_deterministic_answer_commit": self.enable_deterministic_answer_commit,
             },
@@ -1147,7 +1189,13 @@ class ReviewerPipeline(BasicPipeline):
             "failure_reason": parsed.get("failure_reason"),
             "explanation": parsed.get("explanation", ""),
             "round_id": 0,
+            "comparison_view_applied": False,
+            "derived_slots_hidden_from_reviewer": 0,
+            "derived_retrieval_plans_dropped": 0,
+            "comparison_branch_executable": False,
+            "comparison_fallback_to_patch2": question_type == "comparison",
         }
+        state["comparison_output_contract"] = build_comparison_output_contract(question, state)
         return self._coerce_evidence_state(state)
 
     def _normalize_claims(self, claims: Any, valid_slot_ids: set, round_id: int) -> List[Dict[str, Any]]:
@@ -1313,6 +1361,11 @@ class ReviewerPipeline(BasicPipeline):
         )
         slots = annotate_slots_with_intent(slots, answer_intent)
         valid_slot_ids = {slot["slot_id"] for slot in slots}
+        evidence_slot_ids = self._evidence_slot_ids({
+            "question_type": previous_state.get("question_type"),
+            "answer_slots": slots,
+            "comparison_branch_executable": previous_state.get("comparison_branch_executable"),
+        })
 
         old_claims = previous_state.get("claims", [])
         new_claims = self._normalize_claims(parsed.get("claims"), valid_slot_ids, round_id)
@@ -1335,7 +1388,22 @@ class ReviewerPipeline(BasicPipeline):
         if decision not in {"continue_retrieval", "ready_to_answer", "force_answer", "review_failed"}:
             decision = "continue_retrieval"
 
-        retrieval_plan = self._normalize_retrieval_plan(parsed.get("retrieval_plan"), valid_slot_ids)
+        raw_retrieval_plan = parsed.get("retrieval_plan")
+        derived_retrieval_plans_dropped = 0
+        if (
+            self._comparison_branch_control_active(previous_state)
+            and isinstance(raw_retrieval_plan, list)
+        ):
+            original_plan_count = len(raw_retrieval_plan)
+            raw_retrieval_plan = [
+                plan for plan in raw_retrieval_plan
+                if isinstance(plan, dict)
+                and str(plan.get("slot_id") or "") in evidence_slot_ids
+            ]
+            derived_retrieval_plans_dropped = original_plan_count - len(raw_retrieval_plan)
+        retrieval_plan = self._normalize_retrieval_plan(
+            raw_retrieval_plan, evidence_slot_ids or valid_slot_ids
+        )
         final_slots = [
             slot for slot in slots
             if slot.get("slot_role") in {"final_answer", "direct_answer"}
@@ -1345,6 +1413,11 @@ class ReviewerPipeline(BasicPipeline):
         else:
             direct_answer_supported = bool(final_slots) and all(
                 slot.get("status") == "supported" for slot in final_slots
+            )
+        if self._comparison_branch_control_active(previous_state):
+            operand_slots = [slot for slot in slots if slot.get("slot_role") == "comparison_operand"]
+            direct_answer_supported = bool(len(operand_slots) >= 2) and all(
+                slot.get("status") == "supported" for slot in operand_slots
             )
         answer_candidate = str(parsed.get("answer_candidate") or "").strip() or None
         answer_candidate_claim_ids = list(parsed.get("answer_candidate_claim_ids") or [])
@@ -1359,7 +1432,11 @@ class ReviewerPipeline(BasicPipeline):
             if claim.get("slot_id") in final_answer_slot_ids
             and claim.get("support_status") == "support"
         }
-        if answer_candidate and answer_candidate_claim_ids:
+        if (
+            answer_candidate
+            and answer_candidate_claim_ids
+            and not self._comparison_branch_control_active(previous_state)
+        ):
             direct_answer_supported = bool(candidate_claim_ids.intersection(answer_candidate_claim_ids))
 
         ready_guard_triggered = False
@@ -1373,7 +1450,11 @@ class ReviewerPipeline(BasicPipeline):
             decision = "continue_retrieval" if retrieval_plan else "force_answer"
 
         if decision == "continue_retrieval" and not retrieval_plan:
-            unresolved = [slot for slot in slots if slot["status"] in {"missing", "partial", "conflicted"}]
+            unresolved = [
+                slot for slot in slots
+                if slot.get("slot_id") in evidence_slot_ids
+                and slot["status"] in {"missing", "partial", "conflicted"}
+            ]
             if not unresolved:
                 decision = "ready_to_answer" if direct_answer_supported else "force_answer"
             else:
@@ -1389,6 +1470,12 @@ class ReviewerPipeline(BasicPipeline):
             "decision": decision,
             "answer_type": answer_type,
             "answer_intent": answer_intent,
+            "comparison_output_contract": build_comparison_output_contract(question, {
+                "question_type": previous_state.get("question_type"),
+                "answer_type": answer_type,
+                "answer_slots": slots,
+                "answer_intent": answer_intent,
+            }),
             "relation_grounding_trace": previous_state.get("relation_grounding_trace", {}),
             "answer_decision": previous_state.get("answer_decision", {}),
             "direct_answer_supported": direct_answer_supported,
@@ -1402,10 +1489,26 @@ class ReviewerPipeline(BasicPipeline):
             "failure_reason": parsed.get("failure_reason"),
             "explanation": parsed.get("explanation", ""),
             "round_id": round_id,
+            "comparison_view_applied": self._comparison_branch_control_active(previous_state),
+            "derived_slots_hidden_from_reviewer": sum(
+                1 for slot in slots
+                if slot.get("slot_role") == "final_answer" and slot.get("derived_output")
+            ) if self._comparison_branch_control_active(previous_state) else 0,
+            "derived_retrieval_plans_dropped": int(
+                previous_state.get("derived_retrieval_plans_dropped") or 0
+            ) + derived_retrieval_plans_dropped,
+            "comparison_branch_executable": bool(
+                previous_state.get("comparison_branch_executable")
+            ),
+            "comparison_fallback_to_patch2": bool(
+                previous_state.get("question_type") == "comparison"
+                and not self._comparison_branch_control_active(previous_state)
+            ),
         }
         state, consistency_issues = repair_slot_claim_consistency(state, question=question)
         state["state_consistency_issues"] = consistency_issues
         if consistency_issues:
+            comparison_view_applied = self._comparison_branch_control_active(state)
             final_slots = [
                 slot for slot in state.get("answer_slots", [])
                 if slot.get("slot_role") in {"final_answer", "direct_answer"}
@@ -1417,7 +1520,15 @@ class ReviewerPipeline(BasicPipeline):
                 if claim.get("slot_id") in final_answer_slot_ids
                 and claim.get("support_status") == "support"
             }
-            if state.get("answer_candidate") and state.get("answer_candidate_claim_ids"):
+            if comparison_view_applied:
+                operand_slots = [
+                    slot for slot in state.get("answer_slots", [])
+                    if slot.get("slot_role") == "comparison_operand"
+                ]
+                state["direct_answer_supported"] = bool(len(operand_slots) >= 2) and all(
+                    slot.get("status") == "supported" for slot in operand_slots
+                )
+            elif state.get("answer_candidate") and state.get("answer_candidate_claim_ids"):
                 state["direct_answer_supported"] = bool(
                     candidate_claim_ids.intersection(state.get("answer_candidate_claim_ids") or [])
                 )
@@ -1427,10 +1538,13 @@ class ReviewerPipeline(BasicPipeline):
                 )
             unresolved = [
                 slot for slot in state.get("answer_slots", [])
-                if slot.get("status") in {"missing", "partial", "conflicted"}
+                if slot.get("slot_id") in self._evidence_slot_ids(state)
+                and slot.get("status") in {"missing", "partial", "conflicted"}
             ]
             if state.get("decision") == "ready_to_answer":
-                has_candidate = bool(state.get("answer_candidate") or state.get("answer_candidate_claim_ids"))
+                has_candidate = comparison_view_applied and state.get("direct_answer_supported") or bool(
+                    state.get("answer_candidate") or state.get("answer_candidate_claim_ids")
+                )
                 if unresolved or not state.get("direct_answer_supported") or not has_candidate:
                     state["ready_guard_triggered"] = True
                     if state.get("retrieval_plan") and not state.get("guard_extra_round_used"):
@@ -1453,8 +1567,40 @@ class ReviewerPipeline(BasicPipeline):
                 sanitized.append(idx)
         return sanitized
 
+    def _comparison_branch_control_active(self, state: Dict[str, Any]) -> bool:
+        return bool(
+            getattr(self, "enable_comparison_executor", True)
+            and getattr(self, "comparison_branch_mode", "diagnostic") == "control"
+            and state.get("question_type") == "comparison"
+            and state.get("comparison_branch_executable")
+        )
+
     def _slot_coverage(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        if state.get("question_type") == "comparison" and not self._comparison_branch_control_active(state):
+            slots = ReviewState.from_dict(state).answer_slots
+            total = len(slots)
+            supported = sum(slot.status.value == "supported" for slot in slots)
+            conflicted = sum(slot.status.value == "conflicted" for slot in slots)
+            missing = total - supported - conflicted
+            return {
+                "total": total,
+                "supported": supported,
+                "conflicted": conflicted,
+                "missing": missing,
+                "coverage": supported / total if total else 0.0,
+            }
         return ReviewState.from_dict(state).slot_coverage()
+
+    def _evidence_slot_ids(self, state: Dict[str, Any]) -> set:
+        slots = state.get("answer_slots") or []
+        if state.get("question_type") != "comparison" or not self._comparison_branch_control_active(state):
+            return {slot.get("slot_id") for slot in slots if slot.get("slot_id")}
+        return {
+            slot.get("slot_id") for slot in slots
+            if slot.get("slot_id")
+            and slot.get("slot_role") != "final_answer"
+            and not slot.get("derived_output")
+        }
 
     def _build_chain_grounding_trace(
         self,
@@ -1585,6 +1731,7 @@ class ReviewerPipeline(BasicPipeline):
         docs: Optional[List[Dict]] = None,
         question: Optional[str] = None,
     ) -> Dict[str, Any]:
+        state_before = json.dumps(state, ensure_ascii=False, sort_keys=True)
         trace = evaluate_answer_semantics(
             str(question or ""),
             state,
@@ -1599,6 +1746,12 @@ class ReviewerPipeline(BasicPipeline):
                 else "none"
             ),
         )
+        trace["diagnostic_state_mutated"] = state_before != json.dumps(
+            state, ensure_ascii=False, sort_keys=True
+        )
+        trace["diagnostic_query_mutated"] = False
+        trace["diagnostic_prompt_mutated"] = False
+        trace["diagnostic_answer_mutated"] = False
         decision = dict(trace.get("answer_decision") or {})
         if (
             decision.get("commit_mode") == "deterministic_commit"
@@ -1698,6 +1851,50 @@ class ReviewerPipeline(BasicPipeline):
         state["chain_grounding_trace"] = chain_trace
         state["answer_decision"] = answer_decision
 
+        if state.get("question_type") == "comparison" and self.enable_comparison_executor:
+            branch_executable = bool(relation_trace.get("comparison_branch_executable"))
+            state["comparison_branch_status"] = relation_trace.get("comparison_branch_status")
+            state["comparison_branches"] = relation_trace.get("comparison_branches") or []
+            state["comparison_branch_executable"] = branch_executable
+            state["comparison_branch_failure_reason"] = relation_trace.get(
+                "comparison_branch_failure_reason"
+            )
+            state["comparison_branch_build_time_ms"] = float(
+                relation_trace.get("comparison_branch_build_time_ms") or 0.0
+            )
+            state["comparison_fallback_to_patch2"] = not (
+                self.comparison_branch_mode == "control" and branch_executable
+            )
+            state["comparison_guidance_applied"] = bool(
+                self.comparison_branch_mode == "control" and branch_executable
+            )
+            state["comparison_view_applied"] = bool(
+                self.comparison_branch_mode == "control" and branch_executable
+            )
+            state["derived_slots_hidden_from_reviewer"] = sum(
+                1 for slot in state.get("answer_slots") or []
+                if slot.get("slot_role") == "final_answer" and slot.get("derived_output")
+            ) if state["comparison_view_applied"] else 0
+            if self.comparison_branch_mode == "control" and branch_executable:
+                changed = state.get("decision") != "ready_to_answer"
+                answer_decision = dict(state.get("answer_decision") or {})
+                answer_decision.update({
+                    "selected_answer_candidate": None,
+                    "candidate_source": "comparison_executor",
+                    "commit_mode": "guided_generation",
+                    "commit_reason": "comparison_branches_validated",
+                    "committed_claim_ids": [],
+                })
+                state["answer_decision"] = answer_decision
+                relation_trace["answer_decision"] = answer_decision
+                state["decision"] = "ready_to_answer"
+                state["direct_answer_supported"] = True
+                state["retrieval_plan"] = []
+                state["failure_reason"] = None
+                state["guard_extra_round_pending"] = False
+                relation_trace["control_action"] = "comparison_branch_guided_generation"
+                return changed
+
         if self.relation_grounding_mode == "diagnostic":
             return False
 
@@ -1746,8 +1943,13 @@ class ReviewerPipeline(BasicPipeline):
         )
 
     def _has_valid_retrieval_plan(self, state: Dict[str, Any]) -> bool:
+        evidence_slot_ids = self._evidence_slot_ids(state)
         for plan in state.get("retrieval_plan") or []:
-            if isinstance(plan, dict) and str(plan.get("query") or "").strip():
+            if (
+                isinstance(plan, dict)
+                and str(plan.get("query") or "").strip()
+                and (not evidence_slot_ids or plan.get("slot_id") in evidence_slot_ids)
+            ):
                 return True
         return False
 
@@ -1863,6 +2065,40 @@ class ReviewerPipeline(BasicPipeline):
             relation_trace = {}
             answer_decision = state.get("answer_decision") or {}
             chain_trace = self._build_chain_grounding_trace(state, docs, question)
+        comparison_output_contract = build_comparison_output_contract(question or "", state)
+        comparison_commit = validate_final_comparison_commit(
+            relation_trace,
+            comparison_output_contract,
+        ) if comparison_output_contract else {
+            "eligible": False,
+            "candidate": None,
+            "committed_claim_ids": [],
+            "blocked_reason": "not_comparison",
+            "commit_confidence": "blocked",
+            "relation_family": "generic",
+            "relation_value_type_valid": None,
+        }
+        comparison_finalization_mode = getattr(
+            self,
+            "comparison_finalization_mode",
+            {
+                "diagnostic": "baseline",
+                "final_only": "strict_commit",
+            }.get(getattr(self, "comparison_branch_mode", "baseline"), "baseline"),
+        )
+        if comparison_finalization_mode == "strict_commit" and comparison_commit.get("eligible"):
+            answer_decision = {
+                "selected_answer_candidate": comparison_commit.get("candidate"),
+                "candidate_source": "comparison_executor",
+                "commit_mode": "deterministic_commit",
+                "commit_reason": "strict_comparison_branches_validated",
+                "committed_claim_ids": comparison_commit.get("committed_claim_ids") or [],
+            }
+            relation_trace["answer_decision"] = answer_decision
+            relation_trace["control_action"] = "strict_comparison_deterministic_commit"
+            state["answer_decision"] = answer_decision
+            state["comparison_fallback_to_patch2"] = False
+        state["comparison_output_contract"] = comparison_output_contract
         state["chain_grounding_trace"] = chain_trace
         semantic_guidance_applied = bool(
             self.enable_relation_grounding and self.relation_grounding_mode == "control"
@@ -1903,13 +2139,16 @@ class ReviewerPipeline(BasicPipeline):
             claim for claim in state.get("claims", [])
             if claim.get("support_status") == "contradict"
         ]
+        evidence_slot_ids = self._evidence_slot_ids(state)
         insufficient_slots = [
             slot["slot_id"] for slot in state.get("answer_slots", [])
-            if slot.get("status") in {"missing", "partial", "conflicted"}
+            if slot.get("slot_id") in evidence_slot_ids
+            and slot.get("status") in {"missing", "partial", "conflicted"}
         ]
         must_use_slots = [
             slot["slot_id"] for slot in state.get("answer_slots", [])
-            if slot.get("status") == "supported"
+            if slot.get("slot_id") in evidence_slot_ids
+            and slot.get("status") == "supported"
         ]
         final_answer_slot_ids = self._final_answer_slot_ids(state.get("answer_slots", []))
         if not self.enable_relation_grounding and not final_answer_slot_ids and state.get("question_type") == "comparison":
@@ -1926,6 +2165,33 @@ class ReviewerPipeline(BasicPipeline):
         }
         answer_candidates = []
         candidate_records = []
+        comparison_guidance_applied = bool(
+            getattr(self, "comparison_branch_mode", "diagnostic") == "control"
+            and relation_trace.get("comparison_branch_executable")
+        )
+        comparison_candidate = str(
+            relation_trace.get("counterfactual_answer_candidate") or ""
+        ).strip()
+        if comparison_guidance_applied and comparison_candidate:
+            answer_candidates.append(comparison_candidate)
+            candidate_records.append({
+                "candidate": comparison_candidate,
+                "source": "comparison_executor",
+                "slot_id": None,
+                "claim_id": None,
+                "claim_text": "",
+                "slot_role": "derived_output",
+                "has_claim_provenance": bool(
+                    relation_trace.get("counterfactual_claim_ids")
+                ),
+                "chain_grounded": True,
+                "matches_resolved_intermediate": False,
+                "grounding_reason": "comparison_branches_validated",
+                "target_relation_match": True,
+                "candidate_role_valid": True,
+                "candidate_answer_type_match": True,
+                "eligible_for_commit": False,
+            })
         answer_candidate = str(state.get("answer_candidate") or "").strip()
         if answer_candidate:
             answer_candidate_claim_ids = [
@@ -2024,7 +2290,7 @@ class ReviewerPipeline(BasicPipeline):
                     "provenance_valid": bool(binding.get("provenance_valid")),
                 })
         committed_candidate = str(answer_decision.get("selected_answer_candidate") or "").strip()
-        if semantic_guidance_applied and committed_candidate and committed_candidate not in answer_candidates:
+        if committed_candidate and committed_candidate not in answer_candidates:
             answer_candidates.insert(0, committed_candidate)
             candidate_records.insert(0, {
                 "candidate": committed_candidate,
@@ -2099,8 +2365,49 @@ class ReviewerPipeline(BasicPipeline):
             "relation_grounding_trace": relation_trace,
             "answer_decision": answer_decision,
             "semantic_guidance_applied": semantic_guidance_applied,
+            "comparison_guidance_applied": comparison_guidance_applied,
+            "comparison_output_contract": comparison_output_contract,
+            "comparison_output_contract_available": bool(comparison_output_contract),
+            "comparison_output_contract_applied": False,
+            "comparison_finalization_mode": comparison_finalization_mode,
+            "comparison_commit_eligible": bool(comparison_commit.get("eligible")),
+            "comparison_commit_blocked_reason": comparison_commit.get("blocked_reason"),
+            "comparison_commit_confidence": comparison_commit.get("commit_confidence"),
+            "comparison_commit_relation_family": comparison_commit.get("relation_family"),
+            "comparison_commit_relation_value_type_valid": comparison_commit.get(
+                "relation_value_type_valid"
+            ),
+            "comparison_slot_associated_rejected": (
+                comparison_commit.get("blocked_reason") == "slot_associated_path_rejected"
+            ),
+            "comparison_final_candidate_matches_option": bool(
+                comparison_commit.get("eligible") and comparison_commit.get("candidate")
+            ),
+            "comparison_guided_generation": False,
+            "comparison_final_commit_saved_generation": bool(
+                comparison_output_contract
+                and answer_decision.get("commit_mode") == "deterministic_commit"
+            ),
+            "comparison_branches": relation_trace.get("comparison_branches") or [],
+            "comparison_branch_status": relation_trace.get("comparison_branch_status"),
+            "comparison_branch_executable": bool(
+                relation_trace.get("comparison_branch_executable")
+            ),
+            "comparison_branch_failure_reason": relation_trace.get(
+                "comparison_branch_failure_reason"
+            ),
+            "comparison_fallback_to_patch2": bool(
+                state.get("question_type") == "comparison"
+                and not comparison_guidance_applied
+                and not (
+                    comparison_finalization_mode == "strict_commit"
+                    and comparison_commit.get("eligible")
+                )
+            ),
             "diagnostic_candidate_leakage": bool(
-                not semantic_guidance_applied and answer_candidates
+                not semantic_guidance_applied
+                and answer_candidates
+                and answer_decision.get("commit_mode") != "deterministic_commit"
             ),
             "counterfactual_answer_candidate": relation_trace.get("counterfactual_answer_candidate"),
             "counterfactual_candidate_source": relation_trace.get("counterfactual_candidate_source"),
@@ -2147,6 +2454,27 @@ class ReviewerPipeline(BasicPipeline):
         }
 
         lines = []
+        output_contract = policy.get("comparison_output_contract") or {}
+        if output_contract and policy.get("comparison_output_contract_applied"):
+            options = [str(option) for option in output_contract.get("option_entities") or []]
+            lines.append("Comparison output contract:")
+            if output_contract.get("output_role") == "boolean":
+                lines.append("- Return exactly yes or no after comparing the supported operands.")
+            elif options:
+                lines.append("- Return exactly one original question option: " + " | ".join(options[:4]))
+                lines.append("- Do not return the compared date, number, attribute, or intermediate entity.")
+            else:
+                lines.append("- Return the compared entity selected by the question, not an operand value.")
+        if policy.get("comparison_guidance_applied"):
+            lines.append("Validated comparison result:")
+            selected_answer_candidate = str(policy.get("selected_answer_candidate") or "").strip()
+            if selected_answer_candidate:
+                lines.append(f"- Return the original question option: {selected_answer_candidate}")
+            for branch in policy.get("comparison_branches") or []:
+                lines.append(
+                    f"- {branch.get('option')}: {branch.get('raw_value')}"
+                    + (f" via {branch.get('intermediate_entity')}" if branch.get("intermediate_entity") else "")
+                )
         if policy.get("semantic_guidance_applied"):
             lines.append("Relation-validated answer facts:")
             if validated_claims:
@@ -2701,10 +3029,16 @@ class ReviewerPipeline(BasicPipeline):
         return answer.strip()
 
     def _committed_answer_from_policy(self, policy: Optional[Dict[str, Any]]) -> Optional[str]:
-        if not self.enable_deterministic_answer_commit or not policy:
+        if not policy:
             return None
         decision = policy.get("answer_decision") or {}
         if decision.get("commit_mode") != "deterministic_commit":
+            return None
+        comparison_strict_commit = (
+            policy.get("comparison_finalization_mode") == "strict_commit"
+            and policy.get("comparison_commit_eligible")
+        )
+        if not self.enable_deterministic_answer_commit and not comparison_strict_commit:
             return None
         candidate = str(decision.get("selected_answer_candidate") or "").strip()
         return candidate or None
@@ -2867,7 +3201,28 @@ class ReviewerPipeline(BasicPipeline):
 
     def _state_for_reviewer(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """Keep the reviewer state compact so JSON generation is less brittle."""
-        return ReviewState.from_dict(state).compact_for_reviewer()
+        compact = ReviewState.from_dict(state).compact_for_reviewer()
+        if state.get("question_type") != "comparison":
+            return compact
+        if not self._comparison_branch_control_active(state):
+            for slot in compact.get("answer_slots") or []:
+                slot.pop("derived_output", None)
+            return compact
+
+        visible_slot_ids = {
+            slot.get("slot_id")
+            for slot in compact.get("answer_slots") or []
+            if slot.get("slot_role") != "final_answer" and not slot.get("derived_output")
+        }
+        compact["answer_slots"] = [
+            slot for slot in compact.get("answer_slots") or []
+            if slot.get("slot_id") in visible_slot_ids
+        ]
+        compact["claims"] = [
+            claim for claim in compact.get("claims") or []
+            if claim.get("slot_id") in visible_slot_ids
+        ]
+        return compact
 
     def _retrieve_for_plans(
         self,
@@ -3115,6 +3470,58 @@ class ReviewerPipeline(BasicPipeline):
             "candidate_is_intermediate_entity": bool(relation_trace.get("candidate_is_intermediate_entity")),
             "grounded_but_wrong_relation": bool(relation_trace.get("grounded_but_wrong_relation")),
             "comparison_execution_status": relation_trace.get("comparison_execution_status"),
+            "derived_answer_status": relation_trace.get("derived_answer_status"),
+            "comparison_branches": relation_trace.get("comparison_branches") or [],
+            "comparison_branch_status": relation_trace.get("comparison_branch_status"),
+            "comparison_branch_executable": bool(
+                relation_trace.get("comparison_branch_executable")
+            ),
+            "comparison_branch_failure_reason": relation_trace.get(
+                "comparison_branch_failure_reason"
+            ),
+            "comparison_branch_build_time_ms": float(
+                relation_trace.get("comparison_branch_build_time_ms") or 0.0
+            ),
+            "comparison_fallback_to_patch2": bool(
+                state.get("comparison_fallback_to_patch2")
+            ),
+            "comparison_guidance_applied": bool(
+                (policy or {}).get("comparison_guidance_applied")
+                or state.get("comparison_guidance_applied")
+            ),
+            "comparison_output_contract": (policy or {}).get("comparison_output_contract") or {},
+            "comparison_output_contract_available": bool(
+                (policy or {}).get("comparison_output_contract_available")
+            ),
+            "comparison_output_contract_applied": bool(
+                (policy or {}).get("comparison_output_contract_applied")
+            ),
+            "comparison_finalization_mode": (policy or {}).get("comparison_finalization_mode"),
+            "comparison_commit_eligible": bool((policy or {}).get("comparison_commit_eligible")),
+            "comparison_commit_blocked_reason": (policy or {}).get(
+                "comparison_commit_blocked_reason"
+            ),
+            "comparison_commit_confidence": (policy or {}).get(
+                "comparison_commit_confidence"
+            ),
+            "comparison_commit_relation_family": (policy or {}).get(
+                "comparison_commit_relation_family"
+            ),
+            "comparison_commit_relation_value_type_valid": (policy or {}).get(
+                "comparison_commit_relation_value_type_valid"
+            ),
+            "comparison_slot_associated_rejected": bool(
+                (policy or {}).get("comparison_slot_associated_rejected")
+            ),
+            "comparison_final_candidate_matches_option": bool(
+                (policy or {}).get("comparison_final_candidate_matches_option")
+            ),
+            "comparison_guided_generation": bool(
+                (policy or {}).get("comparison_guided_generation")
+            ),
+            "comparison_final_commit_saved_generation": bool(
+                (policy or {}).get("comparison_final_commit_saved_generation")
+            ),
             "intent_source": relation_trace.get("intent_source"),
             "intent_conflict": bool(relation_trace.get("intent_conflict")),
             "operand_binding_status": relation_trace.get("operand_binding_status"),
@@ -3132,6 +3539,20 @@ class ReviewerPipeline(BasicPipeline):
             ),
             "semantic_guidance_applied": bool((policy or {}).get("semantic_guidance_applied")),
             "diagnostic_candidate_leakage": bool((policy or {}).get("diagnostic_candidate_leakage")),
+            "diagnostic_state_mutated": bool(relation_trace.get("diagnostic_state_mutated")),
+            "diagnostic_query_mutated": bool(relation_trace.get("diagnostic_query_mutated")),
+            "diagnostic_prompt_mutated": bool(relation_trace.get("diagnostic_prompt_mutated")),
+            "diagnostic_answer_mutated": bool(relation_trace.get("diagnostic_answer_mutated")),
+            "comparison_view_applied": bool(state.get("comparison_view_applied")),
+            "derived_slots_hidden_from_reviewer": int(
+                state.get("derived_slots_hidden_from_reviewer") or 0
+            ),
+            "derived_retrieval_plans_dropped": int(
+                state.get("derived_retrieval_plans_dropped") or 0
+            ),
+            "non_comparison_prompt_mutated": False,
+            "non_comparison_query_mutated": False,
+            "non_comparison_output_mutated": False,
             "entity_binding_valid": bool(relation_trace.get("entity_binding_valid")),
             "binding_directions": relation_trace.get("binding_directions") or [],
             "original_question_type": state.get("original_question_type", state.get("question_type")),
@@ -3209,6 +3630,34 @@ class ReviewerPipeline(BasicPipeline):
             "answer_style": parsed.get("answer_style", "short_answer"),
             "failure_reason": parsed.get("failure_reason", failure_reason),
         }
+        for key in (
+            "answer_intent",
+            "relation_grounding_trace",
+            "answer_decision",
+            "comparison_output_contract",
+            "comparison_output_contract_available",
+            "comparison_output_contract_applied",
+            "comparison_finalization_mode",
+            "comparison_commit_eligible",
+            "comparison_commit_blocked_reason",
+            "comparison_commit_confidence",
+            "comparison_commit_relation_family",
+            "comparison_commit_relation_value_type_valid",
+            "comparison_slot_associated_rejected",
+            "comparison_final_candidate_matches_option",
+            "comparison_guided_generation",
+            "comparison_final_commit_saved_generation",
+            "comparison_branches",
+            "comparison_branch_status",
+            "comparison_branch_executable",
+            "comparison_branch_failure_reason",
+            "comparison_guidance_applied",
+            "comparison_fallback_to_patch2",
+        ):
+            policy[key] = fallback.get(key)
+        if fallback.get("comparison_final_commit_saved_generation"):
+            policy["selected_answer_candidate"] = fallback.get("selected_answer_candidate")
+            policy["candidate_source"] = fallback.get("candidate_source")
         return policy
 
     def run_review_loop(
